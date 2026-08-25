@@ -1,0 +1,21 @@
+:root { background: transparent; } * { box-sizing: border-box; } html, body, #root { width: 100%; height: 100%; margin: 0; background: transparent; overflow: hidden; }
+.pin-card { position: relative; width: 100%; height: 100%; cursor: grab; -webkit-app-region: no-drag; }
+.pin-card:active { cursor: grabbing; }
+.pin-card--text-mode, .pin-card--text-mode:active { cursor: text; }
+.pin-card::after { content: ""; position: absolute; inset: 0; border: 1px solid rgba(40, 46, 37, .42); box-shadow: inset 0 0 12px rgba(31, 37, 28, .16); pointer-events: none; }
+.pin-card img { width: 100%; height: 100%; display: block; object-fit: fill; user-select: none; }
+.pin-card > button { position: absolute; z-index: 3; top: 5px; right: 5px; width: 28px; height: 28px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: rgba(32,36,30,.72); color: white; opacity: 0; cursor: pointer; transition: opacity .15s ease; }
+.pin-card:hover > button { opacity: 1; }
+.pin-text-layer { position: absolute; z-index: 2; inset: 0; overflow: hidden; pointer-events: none; }
+.pin-text-layer span { position: absolute; background: transparent; }
+.pin-text-layer span.is-selected { background: rgba(37, 99, 216, .34); box-shadow: 0 0 0 .5px rgba(37, 99, 216, .42); }
+.pin-text-actions { position: absolute; z-index: 5; display: flex; align-items: center; gap: 3px; padding: 4px; border: 1px solid rgba(45,51,42,.16); border-radius: 9px; background: rgba(253,252,248,.98); box-shadow: 0 10px 26px rgba(14,18,12,.28); color: #30362d; cursor: default; backdrop-filter: blur(14px); }
+.pin-text-actions button { height: 30px; padding: 0 10px; border: 0; border-radius: 6px; background: transparent; color: inherit; font: 600 11px/1 "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; cursor: pointer; white-space: nowrap; }
+.pin-text-actions button:first-child { background: #527647; color: #fff; }
+.pin-text-actions button:hover { filter: brightness(.96); }
+.pin-text-actions small { margin-left: 3px; opacity: .7; font-size: 9px; }
+.pin-ocr-notice { position: absolute; z-index: 6; left: 50%; bottom: 8px; max-width: calc(100% - 16px); display: flex; align-items: center; gap: 7px; transform: translateX(-50%); padding: 7px 10px; border-radius: 8px; background: rgba(31,37,28,.9); box-shadow: 0 8px 22px rgba(0,0,0,.28); color: #fff; font: 11px/1.3 "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; white-space: nowrap; pointer-events: none; }
+.pin-ocr-notice.is-error { background: rgba(111,42,36,.93); }
+.pin-ocr-notice i { width: 12px; height: 12px; flex: 0 0 12px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: pin-ocr-spin .75s linear infinite; }
+@keyframes pin-ocr-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .pin-card > button { transition: none; }.pin-ocr-notice i { animation-duration: 1.5s; } }

@@ -1,0 +1,9 @@
+node_modules/
+release/
+.tmp/
+.playwright-cli/
+.auth/
+.learnings/
+output/
+*.log
+.DS_Store

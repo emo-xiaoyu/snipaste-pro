@@ -1,0 +1,51 @@
+:root {
+  font-family: "Segoe UI Variable", "Microsoft YaHei UI", sans-serif;
+  color: #252824;
+  background: transparent;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; margin: 0; background: transparent; overflow: hidden; }
+
+.capture-card {
+  width: calc(100% - 8px);
+  height: calc(100% - 8px);
+  margin: 4px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 13px 15px;
+  border: 1px solid rgba(207, 207, 198, .96);
+  border-radius: 15px;
+  background: rgba(253, 252, 248, .97);
+  box-shadow: 0 14px 38px rgba(38, 43, 36, .2), 0 2px 8px rgba(38, 43, 36, .08);
+  animation: capture-in .22s cubic-bezier(.2, .8, .2, 1) both;
+}
+
+.capture-icon {
+  width: 44px;
+  height: 44px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #dce1d7;
+  border-radius: 12px;
+  background: #edf3e8;
+  color: #4f7443;
+}
+
+.capture-icon--url { background: #edf3f3; color: #46646a; }
+.capture-icon--image { background: #eff0f4; color: #5c6074; }
+.capture-icon--file { background: #f4f0e5; color: #7a6339; }
+.capture-copy { min-width: 0; display: grid; gap: 2px; }
+.capture-status { display: flex; align-items: center; gap: 4px; color: #4f7443; font-size: 11px; font-weight: 700; }
+.capture-status svg { width: 14px; height: 14px; }
+.capture-copy strong { overflow: hidden; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.capture-copy small { overflow: hidden; color: #858a82; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+@keyframes capture-in {
+  from { opacity: 0; transform: translateY(10px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (prefers-reduced-motion: reduce) { .capture-card { animation: none; } }

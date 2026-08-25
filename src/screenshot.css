@@ -1,0 +1,44 @@
+:root { font-family: "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; background: transparent; }
+* { box-sizing: border-box; }
+html, body, #root, .shot-stage { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+.shot-stage { position: relative; background: transparent; cursor: crosshair; user-select: none; }
+.shot-stage--select { cursor: crosshair; }
+.shot-stage--text { cursor: text; }
+canvas { width: 100%; height: 100%; display: block; touch-action: none; }
+.shot-stage--pin-edit canvas { position: absolute; z-index: 1; }
+.pin-edit-shadow { position: absolute; z-index: 0; border: 1px solid rgba(255,255,255,.24); background: rgba(255,255,255,.02); box-shadow: 0 14px 34px rgba(10,14,9,.38), 0 3px 10px rgba(10,14,9,.24); pointer-events: none; }
+.selection-box { position: absolute; z-index: 2; border: 1px solid rgba(255,255,255,.94); box-shadow: 0 0 0 1px rgba(24,27,22,.28), inset 0 0 0 1px rgba(24,27,22,.14); pointer-events: none; }
+.selection-handle { position: absolute; width: 9px; height: 9px; border: 1px solid rgba(56,72,51,.7); background: #f8fff5; box-shadow: 0 1px 3px rgba(0,0,0,.22); }
+.selection-handle--nw { left: -5px; top: -5px; }.selection-handle--n { left: 50%; top: -5px; transform: translateX(-50%); }.selection-handle--ne { right: -5px; top: -5px; }
+.selection-handle--e { right: -5px; top: 50%; transform: translateY(-50%); }.selection-handle--se { right: -5px; bottom: -5px; }.selection-handle--s { left: 50%; bottom: -5px; transform: translateX(-50%); }
+.selection-handle--sw { left: -5px; bottom: -5px; }.selection-handle--w { left: -5px; top: 50%; transform: translateY(-50%); }
+.selection-size { position: absolute; left: 0; bottom: -28px; padding: 4px 7px; border-radius: 6px; background: rgba(24,27,22,.9); color: #f8faf6; font-size: 11px; white-space: nowrap; }
+.shot-hint { position: absolute; z-index: 5; top: 28px; left: 50%; display: flex; align-items: center; gap: 9px; transform: translateX(-50%); padding: 10px 14px; border: 1px solid rgba(255,255,255,.18); border-radius: 10px; background: rgba(24,27,22,.82); box-shadow: 0 8px 28px rgba(0,0,0,.25); color: #fff; backdrop-filter: blur(12px); pointer-events: none; }
+.shot-hint strong { font-size: 13px; }.shot-hint span { color: #aeb4aa; font-size: 11px; }
+.pixel-info { position: fixed; z-index: 4; min-width: 174px; display: grid; grid-template-columns: 18px auto; align-items: center; gap: 2px 8px; padding: 7px 9px; border: 1px solid rgba(255,255,255,.16); border-radius: 8px; background: rgba(24,27,22,.9); color: #fff; box-shadow: 0 8px 26px rgba(0,0,0,.26); pointer-events: none; backdrop-filter: blur(12px); }
+.pixel-info i { grid-row: 1 / span 2; width: 18px; height: 18px; border: 1px solid rgba(255,255,255,.55); border-radius: 4px; }
+.pixel-info span { font-size: 11px; font-weight: 700; letter-spacing: .02em; }.pixel-info small { color: #bcc2b8; font-size: 9px; }
+.shot-toolbar { position: absolute; z-index: 6; display: flex; align-items: center; gap: 3px; width: max-content; max-width: calc(100vw - 24px); padding: 6px; border: 1px solid rgba(255,255,255,.18); border-radius: 13px; background: rgba(253,252,248,.97); box-shadow: 0 14px 40px rgba(0,0,0,.3); backdrop-filter: blur(16px); }
+.shot-toolbar button { width: 36px; height: 34px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: #5e645b; cursor: pointer; }
+.shot-toolbar button:hover, .shot-toolbar button.active { background: #e8eee1; color: #426537; }
+.shot-toolbar button:disabled { opacity: .32; cursor: not-allowed; }
+.shot-toolbar button.primary { background: #527647; color: #fff; }
+.separator { width: 1px; height: 22px; margin: 0 3px; background: #dedfd8; }
+.rect-icon { width: 17px; height: 13px; border: 2px solid currentColor; border-radius: 2px; }
+.ellipse-icon { width: 18px; height: 14px; border: 2px solid currentColor; border-radius: 50%; }
+.shot-text-box-preview { position: absolute; z-index: 4; border: 1px dashed rgba(255,255,255,.95); background: rgba(255,255,255,.08); box-shadow: 0 0 0 1px rgba(24,27,22,.28); pointer-events: none; }
+.shot-text-editor { position: absolute; z-index: 5; min-width: 24px; min-height: 24px; margin: 0; padding: 5px; overflow: hidden; resize: none; border: 1px solid rgba(247,255,243,.96); border-radius: 3px; outline: 2px solid rgba(82,118,71,.72); outline-offset: 1px; background: rgba(255,255,255,.08); font-weight: 600; text-shadow: 0 1px 2px rgba(0,0,0,.3); caret-color: currentColor; user-select: text; cursor: text; }
+.shot-text-editor::placeholder { color: rgba(255,255,255,.74); font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,.35); }
+.color-control, .width-control { position: relative; }
+.color-trigger i { width: 17px; height: 17px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 1px #aaaca6; }
+.width-trigger i { width: 20px; border-radius: 999px; background: currentColor; }
+.width-trigger--text { color: #4c5249; }
+.color-popover, .width-popover { position: absolute; left: 50%; bottom: 42px; display: none; align-items: center; gap: 4px; transform: translateX(-50%); padding: 5px; border: 1px solid #dedfd8; border-radius: 10px; background: rgba(253,252,248,.98); box-shadow: 0 10px 30px rgba(0,0,0,.22); }
+.color-control:hover .color-popover, .color-control:focus-within .color-popover, .width-control:hover .width-popover, .width-control:focus-within .width-popover { display: flex; }
+.color-popover button { width: 25px; height: 25px; border: 2px solid transparent; border-radius: 7px; background: var(--swatch); box-shadow: inset 0 0 0 1px rgba(0,0,0,.16); }
+.color-popover button.selected, .width-popover button.selected { border-color: #527647; }
+.width-popover button { width: 30px; height: 26px; }.width-popover i { width: 18px; border-radius: 999px; background: #4c5249; }
+.width-popover--text span { line-height: 1; color: #4c5249; font-weight: 600; }
+.keyboard-tip { position: absolute; z-index: 5; left: 50%; bottom: 70px; transform: translateX(-50%); padding: 5px 9px; border-radius: 7px; background: rgba(24,27,22,.76); color: #dce1d8; font-size: 10px; white-space: nowrap; pointer-events: none; }
+@media (max-width: 780px) { .shot-toolbar { overflow-x: auto; justify-content: flex-start; }.keyboard-tip { display: none; } }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
