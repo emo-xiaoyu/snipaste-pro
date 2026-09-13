@@ -117,8 +117,8 @@
 
 ## Evidence
 
-- Source visual truth: `C:\Users\laofeng\.codex\generated_images\019ff045-3ebe-79f3-8370-20a0a3b03ad1\exec-dd7651c5-2899-478a-a199-f19e3e7c4fd6.png`
-- Implementation screenshot: `E:\snipast-pro\implementation-final.png`
+- Source visual truth: generated design reference image (not distributed with this repository).
+- Implementation screenshot: `implementation-final.png` at the repository root.
 - Source pixels: 1098 × 1432.
 - Implementation pixels: 540 × 720 at CSS viewport 540 × 720, device scale factor 1.
 - Density normalization: source compared at proportional 540 px width (approximately 540 × 704); implementation kept at native CSS density.
