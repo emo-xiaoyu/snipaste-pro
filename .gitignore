@@ -7,3 +7,12 @@ release/
 output/
 *.log
 .DS_Store
+out/
+.v2c/
+.video_agent/
+.gemini/
+.qoder/
+.pi/
+.zcode/
+.agents/
+implementation-*.png
