@@ -6,7 +6,9 @@ const {
   DEFAULT_PREFERENCES,
   capturePinBounds,
   classifyText,
+  coerceImageBytes,
   defaultCaptureRegion,
+  cursorWindowPosition,
   detectSensitive,
   entryTitle,
   fileFingerprint,
@@ -20,10 +22,10 @@ const {
   textFingerprint,
   zoomPinBounds,
 } = require('./clipboard-core.cjs');
-const { createOcrService } = require('./ocr-core.cjs');
-const { createPaddleOcrService } = require('./paddle-ocr-core.cjs');
 const { createPinOcrCache } = require('./pin-ocr-cache.cjs');
+const { createWinOcrService } = require('./win-ocr-core.cjs');
 const { WindowsBridge } = require('./windows-bridge.cjs');
+const { createShortcutHold, shortcutKeyGroups } = require('./shortcut-hold.cjs');
 
 const DEFAULT_SHORTCUT = 'Alt+V';
 const DEFAULT_SCREENSHOT_SHORTCUTS = Object.freeze({
@@ -36,6 +38,7 @@ const HISTORY_LIMIT = 120;
 const POLL_INTERVAL = 650;
 
 let mainWindow;
+let mainWindowModeRevision = 0;
 let captureWindow;
 let screenshotWindow;
 let screenshotHistoryWindow;
@@ -43,6 +46,8 @@ let warmPinWindow;
 let tray;
 const pinWindows = new Map();
 let pollTimer;
+let pollInFlight = false;
+let lastClipboardSequence = null;
 let state = {
   entries: [],
   shortcut: DEFAULT_SHORTCUT,
@@ -65,74 +70,59 @@ let screenshotRendererReady = false;
 let screenshotPinShortcutRegistered = false;
 let desktopCapturePrewarmed = false;
 let storeRevision = 0;
+let storeWriteQueue = Promise.resolve();
+const pendingImageWrites = new Set();
+let shutdownReady = false;
+let shutdownStarted = false;
 const thumbnailCache = new Map();
 const windowsBridge = new WindowsBridge();
-let ocrService;
-let paddleOcrService;
+const shortcutHold = createShortcutHold({
+  keysDown: (groups) => windowsBridge.keysDown(groups),
+  onRelease: () => {
+    mainWindowModeRevision += 1;
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send('window:shortcut-released');
+    mainWindow.hide();
+  },
+});
+const winOcrService = createWinOcrService();
 
-function getOcrService() {
-  if (!ocrService) {
-    ocrService = createOcrService({ dataDir: path.join(app.getPath('userData'), 'ocr') });
+function imageFromPinSource(source) {
+  if (Buffer.isBuffer(source?.bytes) && source.bytes.length) return nativeImage.createFromBuffer(source.bytes);
+  if (source?.imagePath && fs.existsSync(source.imagePath)) {
+    try { return nativeImage.createFromPath(source.imagePath); } catch { /* fall through */ }
   }
-  return ocrService;
-}
-
-function getPaddleOcrService() {
-  if (!paddleOcrService) paddleOcrService = createPaddleOcrService();
-  return paddleOcrService;
+  return source?.dataUrl ? nativeImage.createFromDataURL(String(source.dataUrl)) : nativeImage.createEmpty();
 }
 
 async function recognizePinImage(input) {
-  const dataUrl = typeof input === 'string' ? input : input?.dataUrl;
   const persistedPath = typeof input === 'object' && input?.imagePath && fs.existsSync(input.imagePath)
     ? input.imagePath
     : null;
-  const image = persistedPath ? nativeImage.createFromPath(persistedPath) : nativeImage.createFromDataURL(dataUrl || '');
+  const image = imageFromPinSource(input);
   if (image.isEmpty()) throw new Error('无法读取贴图内容');
   const sourceSize = image.getSize();
+  let imagePath = persistedPath;
   let temporaryPath;
-  let paddlePath = persistedPath;
-  if (!paddlePath) {
+  if (!imagePath) {
     temporaryPath = path.join(app.getPath('temp'), `pasty-ocr-${crypto.randomUUID()}.png`);
     await fs.promises.writeFile(temporaryPath, image.toPNG());
-    paddlePath = temporaryPath;
+    imagePath = temporaryPath;
   }
   try {
-    const paddleResult = await getPaddleOcrService().recognize(paddlePath);
-    if (paddleResult.items.length) {
-      return {
-        success: true,
-        engine: 'paddle',
-        charCount: paddleResult.text.length,
-        confidence: paddleResult.confidence,
-        imageSize: sourceSize,
-        items: paddleResult.items,
-      };
-    }
-  } catch (error) {
-    console.warn('Paddle OCR unavailable, falling back to Tesseract:', error.message);
+    const result = await winOcrService.recognize(imagePath, { sourceSize });
+    if (!result.items.length) throw new Error('没有识别到可选择的文字或数字');
+    return {
+      success: true,
+      engine: 'windows',
+      charCount: result.text.length,
+      confidence: result.confidence,
+      imageSize: sourceSize,
+      items: result.items,
+    };
   } finally {
     if (temporaryPath) void fs.promises.unlink(temporaryPath).catch(() => {});
   }
-  const longestEdge = Math.max(sourceSize.width, sourceSize.height);
-  const upscale = Math.min(4, Math.max(1, 2200 / longestEdge));
-  const ocrImage = upscale > 1
-    ? image.resize({
-        width: Math.round(sourceSize.width * upscale),
-        height: Math.round(sourceSize.height * upscale),
-        quality: 'best',
-      })
-    : image;
-  const result = await getOcrService().recognize(ocrImage.toPNG());
-  if (!result.items.length) throw new Error('没有识别到可选择的文字或数字');
-  return {
-      success: true,
-      engine: 'tesseract',
-    charCount: result.text.length,
-    confidence: result.confidence,
-    imageSize: ocrImage.getSize(),
-    items: result.items,
-  };
 }
 
 const pinOcrCache = createPinOcrCache({ limit: 64, load: recognizePinImage });
@@ -159,16 +149,19 @@ function writeStoreAsync() {
   const revision = ++storeRevision;
   const tempPath = `${storePath}.${process.pid}.${revision}.tmp`;
   const snapshot = JSON.stringify(state, null, 2);
-  return fs.promises.writeFile(tempPath, snapshot, 'utf8').then(() => {
+  const job = storeWriteQueue.then(async () => {
+    if (revision !== storeRevision) return;
+    await fs.promises.writeFile(tempPath, snapshot, 'utf8');
     if (revision !== storeRevision) {
       return fs.promises.unlink(tempPath).catch(() => {});
     }
-    fs.renameSync(tempPath, storePath);
-    return undefined;
+    await fs.promises.rename(tempPath, storePath);
   }).catch((error) => {
     try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
     console.warn('Could not persist clipboard store asynchronously:', error.message);
   });
+  storeWriteQueue = job;
+  return job;
 }
 
 function loadStore() {
@@ -194,9 +187,9 @@ function loadStore() {
   }
 }
 
-function fullImageDataUrl(entry) {
-  if (entry?.type !== 'image' || !entry.imagePath || !fs.existsSync(entry.imagePath)) return null;
-  try { return nativeImage.createFromPath(entry.imagePath).toDataURL(); } catch { return null; }
+function safeReadImageFile(imagePath) {
+  if (!imagePath || !fs.existsSync(imagePath)) return null;
+  try { return fs.readFileSync(imagePath); } catch { return null; }
 }
 
 function trimHistory() {
@@ -204,7 +197,44 @@ function trimHistory() {
   const limit = state.preferences?.historyLimit || HISTORY_LIMIT;
   const transient = state.entries.filter((entry) => !entry.pinned && !entry.custom).slice(0, limit);
   const keep = new Set([...durable, ...transient].map((entry) => entry.id));
-  state.entries = state.entries.filter((entry) => keep.has(entry.id));
+  const removed = state.entries.filter((entry) => !keep.has(entry.id));
+  if (removed.length) {
+    state.entries = state.entries.filter((entry) => keep.has(entry.id));
+    for (const entry of removed) {
+      if (entry.imagePath) thumbnailCache.delete(entry.imagePath);
+    }
+    if (removed.some((entry) => entry.type === 'image')) scheduleImageGc();
+  }
+  return removed;
+}
+
+// Deletes stored images that no entry references anymore (history trim,
+// entry deletion, or a previous crashed session). Debounced so bursts of
+// captures only trigger one directory scan.
+let imageGcTimer;
+function scheduleImageGc(delay = 2500) {
+  clearTimeout(imageGcTimer);
+  imageGcTimer = setTimeout(runImageGc, delay);
+}
+
+function runImageGc() {
+  imageGcTimer = null;
+  if (!imagesDir) return;
+  let names;
+  try { names = fs.readdirSync(imagesDir); } catch { return; }
+  const referenced = new Set(
+    state.entries
+      .filter((entry) => entry.type === 'image' && entry.imagePath)
+      .map((entry) => path.basename(entry.imagePath)),
+  );
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith('.png') || referenced.has(name)) continue;
+    const filePath = path.join(imagesDir, name);
+    try {
+      fs.rmSync(filePath, { force: true });
+      thumbnailCache.delete(filePath);
+    } catch {}
+  }
 }
 
 function thumbnailDataUrl(entry) {
@@ -263,9 +293,9 @@ function mergeDuplicate(fingerprint, source) {
   existing.createdAt = existing.lastCopiedAt;
   if (source) existing.source = source;
   state.entries.unshift(existing);
-  trimHistory();
-  writeStore();
-  broadcast({ capturedEntry: publicEntry(existing) });
+  const removed = trimHistory();
+  writeStoreAsync();
+  broadcastDelta({ capturedEntry: publicEntry(existing), removedIds: removed.map((entry) => entry.id) });
   showCaptureToast(existing);
   return existing;
 }
@@ -287,15 +317,24 @@ function showCaptureToast(entry) {
   captureHideTimer = setTimeout(() => captureWindow?.hide(), 2200);
 }
 
-function broadcast(extra) {
+// Full state sync is reserved for the initial window load and rare
+// user-triggered resets; clipboard changes travel as small deltas so a
+// capture does not re-ship every thumbnail over IPC.
+function broadcast(extra = {}) {
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('clipboard:state-changed', publicState(extra));
+    mainWindow.webContents.send('clipboard:state-changed', { full: true, ...publicState(extra) });
+  }
+}
+
+function broadcastDelta(extra = {}) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('clipboard:state-changed', { full: false, ...extra });
   }
 }
 
 function addText(content, options = {}) {
-  const normalized = normalizeText(content);
-  if (!normalized) return null;
+  const normalized = String(content ?? '').replace(/\0/g, '').replace(/\r\n/g, '\n');
+  if (!normalized.trim()) return null;
   const html = state.preferences.captureRichText ? String(options.html || '') : '';
   const fingerprint = textFingerprint(normalized, html);
   if (!options.custom && fingerprint !== lastFingerprint) suppressFingerprint = '';
@@ -303,7 +342,7 @@ function addText(content, options = {}) {
   const sensitive = detectSensitive(normalized);
   if (!options.custom && sensitive && state.preferences.protectSensitive) {
     lastFingerprint = fingerprint;
-    broadcast({ notice: `检测到${sensitive.label}，已跳过记录` });
+    broadcastDelta({ notice: `检测到${sensitive.label}，已跳过记录` });
     return null;
   }
   lastFingerprint = fingerprint;
@@ -332,9 +371,9 @@ function addText(content, options = {}) {
     custom: Boolean(options.custom),
   };
   state.entries.unshift(entry);
-  trimHistory();
-  writeStore();
-  broadcast({ capturedEntry: publicEntry(entry) });
+  const removed = trimHistory();
+  writeStoreAsync();
+  broadcastDelta({ capturedEntry: publicEntry(entry), removedIds: removed.map((item) => item.id) });
   showCaptureToast(entry);
   return entry;
 }
@@ -375,22 +414,24 @@ function addImage(image, options = {}) {
     custom: Boolean(options.custom),
   };
   state.entries.unshift(entry);
-  trimHistory();
-  if (options.asyncWrite) {
-    const imageWrite = needsImageWrite ? fs.promises.writeFile(imagePath, png) : Promise.resolve();
-    imageWrite.then(() => writeStoreAsync()).then(() => {
-      broadcast({ capturedEntry: publicEntry(entry) });
-      showCaptureToast(entry);
-    }).catch((error) => {
-      console.warn('Could not persist screenshot image:', error.message);
-      broadcast({ notice: '截图已固定，但本地历史写入失败' });
-    });
-  } else {
-    if (needsImageWrite) fs.writeFileSync(imagePath, png);
-    writeStore();
-    broadcast({ capturedEntry: publicEntry(entry) });
+  const removed = trimHistory();
+  if (removed.length) broadcastDelta({ removedIds: removed.map((item) => item.id) });
+  // Image bytes and the store both persist asynchronously; broadcast and the
+  // toast follow once the thumbnail can actually be read from disk.
+  const imageWrite = needsImageWrite ? fs.promises.writeFile(imagePath, png) : Promise.resolve();
+  const persistence = imageWrite.then(() => writeStoreAsync()).then(() => {
+    // The user may delete this image, or a later capture may trim it, while
+    // its bytes are being written. Never resurrect it in the renderer.
+    const capturedIndex = state.entries.findIndex((item) => item.id === entry.id);
+    if (capturedIndex < 0) return;
+    broadcastDelta({ capturedEntry: publicEntry(entry), capturedIndex });
     showCaptureToast(entry);
-  }
+  }).catch((error) => {
+    console.warn('Could not persist clipboard image:', error.message);
+    broadcastDelta({ notice: '图片已记录，但本地历史写入失败' });
+  });
+  pendingImageWrites.add(persistence);
+  void persistence.finally(() => pendingImageWrites.delete(persistence));
   return entry;
 }
 
@@ -414,9 +455,9 @@ function addFiles(files, options = {}) {
     pinned: false, custom: false,
   };
   state.entries.unshift(entry);
-  trimHistory();
-  writeStore();
-  broadcast({ capturedEntry: publicEntry(entry) });
+  const removed = trimHistory();
+  writeStoreAsync();
+  broadcastDelta({ capturedEntry: publicEntry(entry), removedIds: removed.map((item) => item.id) });
   showCaptureToast(entry);
   return entry;
 }
@@ -437,12 +478,18 @@ function readFilePaths(formats) {
   return [];
 }
 
-function inspectClipboard() {
+async function inspectClipboard() {
   try {
     if (state.preferences.trackSource) refreshSourceContext();
     const formats = clipboard.availableFormats();
     if (state.preferences.captureFiles) {
-      const files = readFilePaths(formats);
+      // FileNameW contains only one path on some Windows applications. Read
+      // the native file-drop list to retain every selected file and UNC path.
+      let files = [];
+      if (process.platform === 'win32' && windowsBridge.isAvailable()) {
+        try { files = await windowsBridge.readFiles(); } catch {}
+      }
+      if (!Array.isArray(files) || !files.length) files = readFilePaths(formats);
       if (files.length) { addFiles(files, { formats }); return; }
     }
     const hasImage = formats.some((format) => /image/i.test(format));
@@ -459,15 +506,38 @@ function inspectClipboard() {
   }
 }
 
-function writeEntryToClipboard(entry) {
+// Polling fast path: when the Windows bridge is healthy, the clipboard
+// sequence number lets us skip re-reading (and PNG re-encoding) unchanged
+// clipboard content on every tick.
+async function pollClipboard() {
+  if (pollInFlight) return;
+  pollInFlight = true;
+  try {
+    if (process.platform === 'win32' && windowsBridge.isAvailable()) {
+      try {
+        const sequence = await windowsBridge.clipboardSequence();
+        if (Number.isFinite(sequence) && lastClipboardSequence === sequence) return;
+        lastClipboardSequence = sequence;
+      } catch {
+        // Bridge hiccup on the fast path: fall through to a full inspect.
+      }
+    }
+    await inspectClipboard();
+  } finally {
+    pollInFlight = false;
+  }
+}
+
+async function writeEntryToClipboard(entry) {
   if (entry.type === 'image') {
     if (!entry.imagePath || !fs.existsSync(entry.imagePath)) throw new Error('图片文件已不存在');
     const image = nativeImage.createFromPath(entry.imagePath);
     suppressFingerprint = entry.fingerprint;
     clipboard.writeImage(image);
   } else if (entry.type === 'file') {
+    if (entry.files?.length) await windowsBridge.writeFiles(entry.files);
+    else clipboard.writeText(entry.content || '');
     suppressFingerprint = entry.fingerprint;
-    clipboard.writeText((entry.files || []).join('\n') || entry.content || '');
   } else {
     suppressFingerprint = entry.fingerprint;
     if (entry.html) clipboard.write({ text: entry.content || '', html: entry.html });
@@ -479,30 +549,35 @@ function writeEntryToClipboard(entry) {
 function sendPasteKeystroke(targetHandle, targetSource) {
   const delayMs = resolvePasteDelay(state.preferences, targetSource);
   windowsBridge.paste(targetHandle, delayMs).catch(() => {
-    broadcast({ notice: '内容已复制；自动粘贴暂时不可用。' });
+    broadcastDelta({ notice: '内容已复制；自动粘贴暂时不可用。' });
   });
 }
 
-function positionWindow() {
-  const cursor = screen.getCursorScreenPoint();
-  const display = screen.getDisplayNearestPoint(cursor);
-  const { x, y, width, height } = display.workArea;
-  const bounds = mainWindow.getBounds();
-  mainWindow.setPosition(
-    Math.round(x + (width - bounds.width) / 2),
-    Math.round(y + Math.max(36, (height - bounds.height) * 0.28)),
-    false,
-  );
+function setMainWindowMode(mode, invocationCursor = null) {
+  mainWindowModeRevision += 1;
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const current = mainWindow.getBounds();
+  // Only a fresh invocation follows the mouse. Selecting a sector must not
+  // relocate the panel toward that click; navigation keeps the window center.
+  const anchor = invocationCursor || { x: current.x + current.width / 2, y: current.y + current.height / 2 };
+  const size = mode === 'clipboard' ? { width: 540, height: 720 } : { width: 520, height: 520 };
+  const { workArea } = screen.getDisplayNearestPoint(anchor);
+  const fitted = { width: Math.min(size.width, workArea.width), height: Math.min(size.height, workArea.height) };
+  const position = cursorWindowPosition(workArea, fitted, anchor);
+  // Commit size and position together, rather than moving the old-sized wheel
+  // in one native update and resizing it in another.
+  mainWindow.setBounds({ ...position, ...fitted }, false);
 }
 
 function showWindow(options = {}) {
   if (!mainWindow) return;
-  if (options.fromShortcut && mainWindow.isVisible() && mainWindow.isFocused()) {
-    mainWindow.hide();
-    return;
-  }
+  const invocationCursor = screen.getCursorScreenPoint();
   if (options.fromShortcut) {
-    windowsBridge.foreground().then((source) => {
+    if (shortcutRecordingActive) return;
+    const session = shortcutHold.start(state.shortcut || DEFAULT_SHORTCUT);
+    if (!session) return;
+    return Promise.all([windowsBridge.foreground().catch(() => null), session.ready]).then(async ([source, held]) => {
+      if (!held || !shortcutHold.isActive(session) || !shortcutHold.isPending() || !await shortcutHold.check(session)) return;
       const normalized = normalizeSource(source);
       if (normalized) {
         lastExternalSource = normalized;
@@ -510,23 +585,19 @@ function showWindow(options = {}) {
       } else {
         previousWindowHandle = lastExternalSource?.handle || null;
       }
-      revealWindow();
-    }).catch(() => {
-      previousWindowHandle = lastExternalSource?.handle || null;
-      revealWindow();
+      revealWindow(invocationCursor, { shortcutKeys: session.groups.flat(), shortcutSession: session.id });
     });
-    return;
   }
-  revealWindow();
+  shortcutHold.stop();
+  revealWindow(invocationCursor);
 }
 
-function revealWindow() {
-  positionWindow();
+function revealWindow(cursor, invocation = null) {
+  setMainWindowMode('launcher', cursor);
   mainWindow.show();
   mainWindow.focus();
   mainWindow.webContents.focus();
-  mainWindow.webContents.send('window:focus-search');
-  setTimeout(() => mainWindow?.webContents.send('window:focus-search'), 80);
+  mainWindow.webContents.send('window:open-launcher', invocation);
 }
 
 function quitApplication() {
@@ -549,11 +620,11 @@ function createTray() {
     { type: 'separator' },
     {
       label: '截图',
-      click: () => captureCurrentDisplay().catch((error) => broadcast({ notice: error.message })),
+      click: () => captureCurrentDisplay().catch((error) => broadcastDelta({ notice: String(error.message || error) })),
     },
     {
       label: '快速截图并固定',
-      click: () => captureCurrentDisplay({ pinImmediately: true }).catch((error) => broadcast({ notice: error.message })),
+      click: () => captureCurrentDisplay({ pinImmediately: true }).catch((error) => broadcastDelta({ notice: String(error.message || error) })),
     },
     { label: '截图历史', click: () => showScreenshotHistory() },
     { type: 'separator' },
@@ -564,6 +635,7 @@ function createTray() {
 }
 
 function registerAppShortcut(nextShortcut, options = {}) {
+  if (!shortcutKeyGroups(nextShortcut)) return { success: false, message: '此快捷键暂不支持按住唤出，请使用字母、数字或标准功能键组合' };
   const previous = state.shortcut || DEFAULT_SHORTCUT;
   globalShortcut.unregister(previous);
   const success = globalShortcut.register(nextShortcut, () => showWindow({ fromShortcut: true }));
@@ -573,8 +645,8 @@ function registerAppShortcut(nextShortcut, options = {}) {
   }
   state.shortcut = nextShortcut;
   if (options.persist !== false) {
-    writeStore();
-    broadcast({ notice: `快捷键已更新为 ${nextShortcut}` });
+    writeStoreAsync();
+    broadcastDelta({ notice: `快捷键已更新为 ${nextShortcut}`, shortcut: state.shortcut });
   }
   return { success: true, shortcut: nextShortcut };
 }
@@ -597,6 +669,7 @@ function restoreConfigurableShortcuts() {
 }
 
 function setShortcutRecording(active) {
+  shortcutHold.stop();
   shortcutRecordingActive = Boolean(active);
   if (shortcutRecordingActive) unregisterConfigurableShortcuts();
   else restoreConfigurableShortcuts();
@@ -607,6 +680,7 @@ function updateAllShortcuts(nextAppShortcut, nextScreenshotShortcuts) {
   const previousAppShortcut = state.shortcut || DEFAULT_SHORTCUT;
   const previousScreenshotShortcuts = { ...DEFAULT_SCREENSHOT_SHORTCUTS, ...state.screenshotShortcuts };
   const candidateAppShortcut = String(nextAppShortcut || '').trim();
+  if (!shortcutKeyGroups(candidateAppShortcut)) return { success: false, message: '主窗口快捷键不支持按住检测，请使用字母、数字或标准功能键组合' };
   const candidateScreenshotShortcuts = { ...DEFAULT_SCREENSHOT_SHORTCUTS, ...(nextScreenshotShortcuts || {}) };
   const values = configurableShortcutValues(candidateAppShortcut, candidateScreenshotShortcuts);
   if (values.some((value) => !value) || new Set(values.map((value) => value.toLocaleLowerCase())).size !== values.length) {
@@ -638,8 +712,8 @@ function updateAllShortcuts(nextAppShortcut, nextScreenshotShortcuts) {
   state.shortcut = candidateAppShortcut;
   state.screenshotShortcuts = candidateScreenshotShortcuts;
   if (shortcutRecordingActive) unregisterConfigurableShortcuts();
-  writeStore();
-  broadcast({ notice: '快捷键已保存并生效' });
+  writeStoreAsync();
+  broadcastDelta({ notice: '快捷键已保存并生效', shortcut: state.shortcut, screenshotShortcuts: state.screenshotShortcuts });
   return {
     success: true,
     shortcut: state.shortcut,
@@ -651,9 +725,9 @@ function screenshotShortcutBindings(shortcuts) {
   return [
     [shortcuts.capture, () => {
       traceScreenshotTiming('capture-shortcut-received');
-      captureCurrentDisplay().catch((error) => broadcast({ notice: error.message }));
+      captureCurrentDisplay().catch((error) => broadcastDelta({ notice: String(error.message || error) }));
     }],
-    [shortcuts.quickPin, () => captureCurrentDisplay({ pinImmediately: true }).catch((error) => broadcast({ notice: error.message }))],
+    [shortcuts.quickPin, () => captureCurrentDisplay({ pinImmediately: true }).catch((error) => broadcastDelta({ notice: String(error.message || error) }))],
     [shortcuts.history, showScreenshotHistory],
   ];
 }
@@ -727,8 +801,8 @@ function registerScreenshotShortcuts(next = state.screenshotShortcuts, options =
   }
   state.screenshotShortcuts = candidate;
   if (options.persist !== false) {
-    writeStore();
-    broadcast({ notice: '截图快捷键已更新' });
+    writeStoreAsync();
+    broadcastDelta({ notice: '截图快捷键已更新', screenshotShortcuts: candidate });
   }
   return { success: true, screenshotShortcuts: candidate };
 }
@@ -762,10 +836,10 @@ async function captureCurrentDisplay(options = {}) {
   });
   if (cropped.isEmpty()) throw new Error('无法截取鼠标附近区域');
   if (options.pinImmediately) {
-    const entry = addImage(cropped, { formats: ['image/png'], origin: 'screenshot', asyncWrite: true });
+    const entry = addImage(cropped, { formats: ['image/png'], origin: 'screenshot', force: true });
     if (!entry) return;
     clipboard.writeImage(cropped);
-    openPinWindow(entry, { bounds: region, image: cropped, imageUrl: cropped.toDataURL() });
+    openPinWindow(entry, { bounds: region, image: cropped });
     return;
   }
   const imagePayload = { imageBytes };
@@ -922,12 +996,14 @@ function revealPinWindow(pinWindow, id) {
 }
 
 function pinImage(pinWindow) {
-  const dataUrl = pinWindow?.__pinImageDataUrl || '';
-  const image = dataUrl ? nativeImage.createFromDataURL(dataUrl) : nativeImage.createFromPath(pinWindow?.__pinImagePath || '');
-  return image && !image.isEmpty() ? image : null;
+  const image = imageFromPinSource({
+    bytes: pinWindow?.__pinImageBuffer,
+    imagePath: pinWindow?.__pinImagePath,
+  });
+  return image.isEmpty() ? null : image;
 }
 
-function pinEntryPayload(pinWindow, imageUrl, size) {
+function pinEntryPayload(pinWindow, imageBytes, size) {
   const entry = state.entries.find((item) => item.id === pinWindow.__pinEntryId && item.type === 'image');
   return entry ? {
     id: entry.id,
@@ -937,32 +1013,36 @@ function pinEntryPayload(pinWindow, imageUrl, size) {
       height: size.height,
       content: `${size.width} × ${size.height} · PNG`,
       imagePath: undefined,
-      imageUrl,
+      imageBytes,
     },
   } : null;
 }
 
-function updatePinImage(pinWindow, dataUrl, options = {}) {
+function updatePinImage(pinWindow, source, options = {}) {
   if (!pinWindow || pinWindow.isDestroyed()) return { success: false, message: '贴图已关闭' };
-  const image = nativeImage.createFromDataURL(String(dataUrl || ''));
+  const image = imageFromPinSource(source);
   if (image.isEmpty()) return { success: false, message: '图片变换结果无效' };
   const size = image.getSize();
   const ratio = size.width / size.height;
   const bounds = pinWindow.getContentBounds();
   const nextBounds = resetPinBounds(bounds, bounds.width * bounds.height, ratio);
-  pinWindow.__pinImageDataUrl = image.toDataURL();
+  pinWindow.__pinImageBuffer = Buffer.isBuffer(source?.bytes) && source.bytes.length ? source.bytes : image.toPNG();
   pinWindow.__pinImagePath = null;
   pinWindow.__pinImageSize = size;
+  // The area-preserving reset size becomes the new 100% zoom reference.
+  pinWindow.__pinBaseArea = nextBounds.width * nextBounds.height;
+  pinWindow.__pinBaseWidth = nextBounds.width;
+  pinWindow.__pinBaseHeight = nextBounds.height;
   pinOcrCache.delete(pinWindow.__pinEntryId);
   pinWindow.setContentBounds(nextBounds);
   pinWindow.setAspectRatio(ratio);
   pinWindow.setAlwaysOnTop(true, 'screen-saver');
   pinWindow.moveTop();
   if (options.notifyRenderer) {
-    const payload = pinEntryPayload(pinWindow, pinWindow.__pinImageDataUrl, size);
+    const payload = pinEntryPayload(pinWindow, pinWindow.__pinImageBuffer, size);
     if (payload) pinWindow.webContents.send('pin:show', payload);
   }
-  return { success: true, imageUrl: pinWindow.__pinImageDataUrl, size, bounds: nextBounds };
+  return { success: true, imageBytes: pinWindow.__pinImageBuffer, size, bounds: nextBounds };
 }
 
 function zoomPinWindow(pinWindow, payload = {}) {
@@ -976,7 +1056,21 @@ function zoomPinWindow(pinWindow, payload = {}) {
   pinWindow.setContentBounds(nextBounds);
   pinWindow.setAlwaysOnTop(true, 'screen-saver');
   pinWindow.moveTop();
-  return { success: true, bounds: nextBounds };
+  // 100% is the size the pin was created at (or reset to after a transform),
+  // not the pre-zoom size, so the HUD keeps showing absolute zoom.
+  const baseWidth = Number(pinWindow.__pinBaseWidth);
+  const scale = baseWidth > 0 ? nextBounds.width / baseWidth : 1;
+  return { success: true, bounds: nextBounds, scale: Math.round(scale * 100) / 100 };
+}
+
+// Ctrl+wheel opacity for desktop pins, kept session-local like the zoom.
+function setPinWindowOpacity(pinWindow, requested) {
+  if (!pinWindow || pinWindow.isDestroyed()) return { success: false, message: '贴图已关闭' };
+  const opacity = Math.min(1, Math.max(0.15, Number(requested)));
+  if (!Number.isFinite(opacity)) return { success: false, message: '不透明度无效' };
+  pinWindow.setOpacity(opacity);
+  pinWindow.__pinOpacity = opacity;
+  return { success: true, opacity };
 }
 
 function notifyPinOperation(pinWindow, result) {
@@ -1018,7 +1112,7 @@ function editPinImage(pinWindow) {
   };
   currentCapture = { editPinId: id, display, sourceSize: size };
   pinWindow.hide();
-  openScreenshotEditor(display, pinWindow.__pinImageDataUrl || image.toDataURL(), editorBounds, {
+  openScreenshotEditor(display, { imageBytes: pinWindow.__pinImageBuffer || image.toPNG() }, editorBounds, {
     x: 0, y: 0, width: size.width, height: size.height,
   }, {
     editPinId: id,
@@ -1068,6 +1162,14 @@ function showPinContextMenu(event, payload) {
       { label: '缩小', click: () => centerZoom(100) },
       { label: '恢复初始大小', click: () => zoomPinWindow(pinWindow, { reset: true }) },
     ] },
+    { label: '不透明度', submenu: [1, 0.8, 0.6, 0.4, 0.2].map((value) => ({
+      label: `${Math.round(value * 100)}%`,
+      type: 'radio',
+      checked: Math.abs((Number.isFinite(pinWindow.__pinOpacity) ? pinWindow.__pinOpacity : 1) - value) < 0.001,
+      // Routed through the renderer so its opacity state stays the single
+      // source of truth for later Ctrl+wheel steps.
+      click: () => sendCommand(`set-opacity:${value}`),
+    })) },
     { type: 'separator' },
     { label: '关闭贴图', click: () => pinWindow.destroy() },
   );
@@ -1084,15 +1186,23 @@ function openPinWindow(entry, options = {}) {
     existing.focus();
     return { success: true };
   }
-  const image = options.image && !options.image.isEmpty?.() ? options.image : nativeImage.createFromPath(entry.imagePath);
+  // Prefer PNG bytes that are already in hand (renderer-provided or the
+  // stored image file); avoid a decode + base64 re-encode round trip.
+  const imageBytes = (Buffer.isBuffer(options.imageBytes) && options.imageBytes.length)
+    ? options.imageBytes
+    : safeReadImageFile(entry.imagePath);
+  const image = options.image && !options.image.isEmpty?.()
+    ? options.image
+    : imageFromPinSource({ bytes: imageBytes || undefined, imagePath: entry.imagePath });
   if (image.isEmpty()) return { success: false, message: '截图文件已不存在' };
+  const finalBytes = imageBytes || image.toPNG();
   const size = image.getSize();
   const exactBounds = options.bounds && options.bounds.width > 0 && options.bounds.height > 0 ? options.bounds : null;
   const maxWidth = 520;
   const maxHeight = 420;
   const ratio = Math.min(1, maxWidth / size.width, maxHeight / size.height);
-  const contentWidth = exactBounds ? Math.round(exactBounds.width) : Math.max(180, Math.round(size.width * ratio));
-  const contentHeight = exactBounds ? Math.round(exactBounds.height) : Math.max(120, Math.round(size.height * ratio));
+  const contentWidth = exactBounds ? Math.round(exactBounds.width) : Math.max(1, Math.round(size.width * ratio));
+  const contentHeight = exactBounds ? Math.round(exactBounds.height) : Math.max(1, Math.round(size.height * ratio));
   const contentBounds = exactBounds ? {
     x: Math.round(exactBounds.x), y: Math.round(exactBounds.y),
     width: contentWidth, height: contentHeight,
@@ -1107,15 +1217,19 @@ function openPinWindow(entry, options = {}) {
       height: contentHeight,
     };
   })();
-  const pinImageUrl = options.imageUrl || fullImageDataUrl(entry);
   pinWindow.__pinEntryId = entry.id;
-  pinWindow.__pinImageDataUrl = pinImageUrl;
+  pinWindow.__pinImageBuffer = finalBytes;
   pinWindow.__pinImagePath = entry.imagePath;
   pinWindow.__pinImageSize = size;
   pinWindow.__pinBaseArea = targetBounds.width * targetBounds.height;
+  pinWindow.__pinBaseWidth = targetBounds.width;
+  pinWindow.__pinBaseHeight = targetBounds.height;
+  // The warm window may carry a previous pin's faded state.
+  pinWindow.setOpacity(1);
+  pinWindow.__pinOpacity = 1;
   pinWindow.__pendingPinPayload = {
     id: entry.id,
-    entry: { ...entry, imagePath: undefined, imageUrl: pinImageUrl },
+    entry: { ...entry, imagePath: undefined, imageBytes: finalBytes },
   };
   pinWindow.setContentBounds(targetBounds);
   pinWindow.setAspectRatio(size.width / size.height);
@@ -1128,10 +1242,10 @@ function openPinWindow(entry, options = {}) {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 540,
-    height: 720,
+    width: 520,
+    height: 520,
     minWidth: 440,
-    minHeight: 560,
+    minHeight: 480,
     show: false,
     frame: false,
     transparent: true,
@@ -1160,6 +1274,11 @@ function createWindow() {
   });
   mainWindow.on('blur', () => {
     if (mainWindow?.isVisible() && !mainWindow.webContents.isDevToolsOpened()) mainWindow.hide();
+  });
+  mainWindow.on('hide', () => shortcutHold.commit());
+  mainWindow.webContents.on('before-input-event', (_event, input) => {
+    if (input.type !== 'keyUp') return;
+    for (const key of shortcutKeyGroups(input.key)?.flat() || []) shortcutHold.keyUp(key);
   });
   mainWindow.webContents.once('did-finish-load', () => {
     showWindow();
@@ -1196,12 +1315,12 @@ function createCaptureWindow() {
 }
 
 ipcMain.handle('clipboard:get-state', () => publicState());
-ipcMain.handle('clipboard:paste-entry', (_event, id) => {
+ipcMain.handle('clipboard:paste-entry', async (_event, id) => {
   const entry = state.entries.find((item) => item.id === id);
   if (!entry) return { success: false, message: '这条内容已不存在' };
   try {
     const targetSource = lastExternalSource;
-    writeEntryToClipboard(entry);
+    await writeEntryToClipboard(entry);
     mainWindow.hide();
     sendPasteKeystroke(previousWindowHandle, targetSource);
     previousWindowHandle = null;
@@ -1212,20 +1331,23 @@ ipcMain.handle('clipboard:paste-entry', (_event, id) => {
 });
 ipcMain.handle('clipboard:toggle-pin', (_event, id) => {
   const entry = state.entries.find((item) => item.id === id);
-  if (!entry) return publicState();
+  if (!entry) return { success: false, message: '这条内容已不存在' };
   entry.pinned = !entry.pinned;
-  writeStore();
-  broadcast();
-  return publicState();
+  writeStoreAsync();
+  broadcastDelta({ updatedEntry: publicEntry(entry) });
+  return { success: true };
 });
 ipcMain.handle('clipboard:delete-entry', (_event, id) => {
   const pinWindow = pinWindows.get(id);
   if (pinWindow && !pinWindow.isDestroyed()) pinWindow.destroy();
   pinOcrCache.delete(id);
+  const removed = state.entries.find((item) => item.id === id);
   state.entries = state.entries.filter((item) => item.id !== id);
-  writeStore();
-  broadcast();
-  return publicState();
+  if (removed?.imagePath) thumbnailCache.delete(removed.imagePath);
+  writeStoreAsync();
+  scheduleImageGc();
+  broadcastDelta({ removedIds: [id] });
+  return { success: true };
 });
 ipcMain.handle('clipboard:create-entry', (_event, payload) => {
   if (payload?.type === 'image') {
@@ -1240,22 +1362,56 @@ ipcMain.handle('clipboard:create-entry', (_event, payload) => {
   });
   return entry ? { success: true } : { success: false, message: '请输入要保存的内容' };
 });
+ipcMain.handle('window:set-mode', async (_event, mode) => {
+  const target = mainWindow;
+  if (!target || target.isDestroyed()) return { success: false };
+  const revision = ++mainWindowModeRevision;
+  // rAF runs before paint; flushing Chromium's current surface ensures the
+  // destination page replaces the wheel before native bounds are committed.
+  try {
+    await target.webContents.capturePage();
+  } catch {
+    return { success: false };
+  }
+  if (target !== mainWindow || target.isDestroyed() || revision !== mainWindowModeRevision) return { success: false };
+  setMainWindowMode(mode === 'clipboard' ? 'clipboard' : 'launcher');
+  return { success: true };
+});
+ipcMain.handle('launcher:activate', async (_event, { sessionId = null } = {}) => {
+  if (sessionId !== null && (!shortcutHold.isPending() || shortcutHold.sessionId() !== sessionId)) return { success: false };
+  if (shortcutHold.isPending()) {
+    if (sessionId !== shortcutHold.sessionId()) return { success: false };
+    // Recheck native key ownership before accepting a click or pointer release.
+    // The renderer's key-up event may be in transit or focus may have changed.
+    if (!await shortcutHold.check()) return { success: false };
+    shortcutHold.commit();
+  }
+  return { success: true };
+});
+ipcMain.on('window:shortcut-release', () => shortcutHold.release());
 ipcMain.handle('clipboard:update-shortcut', (_event, accelerator) => registerAppShortcut(accelerator));
+ipcMain.handle('clipboard:write-text', (_event, text) => {
+  const content = String(text ?? '');
+  clipboard.writeText(content);
+  return { success: true };
+});
 ipcMain.handle('screenshot:update-shortcuts', (_event, shortcuts) => registerScreenshotShortcuts(shortcuts));
 ipcMain.handle('shortcuts:set-recording', (_event, active) => setShortcutRecording(active));
 ipcMain.handle('shortcuts:update-all', (_event, payload) => updateAllShortcuts(payload?.shortcut, payload?.screenshotShortcuts));
 ipcMain.handle('clipboard:update-preferences', (_event, preferences) => {
   state.preferences = mergePreferences({ ...state.preferences, ...(preferences || {}) });
   trimHistory();
-  writeStore();
+  writeStoreAsync();
   broadcast({ notice: '复制记录设置已更新' });
-  return publicState();
+  return { success: true, preferences: state.preferences };
 });
 ipcMain.handle('screenshot:save', (_event, payload) => {
   try {
     traceScreenshotTiming('save-ipc-start');
+    // Renderer sends raw PNG bytes when possible; dataUrl stays as a fallback.
+    const imageBytes = coerceImageBytes(payload?.imageBytes);
     const dataUrl = String(payload?.dataUrl || '');
-    const image = nativeImage.createFromDataURL(dataUrl);
+    const image = imageBytes ? nativeImage.createFromBuffer(imageBytes) : nativeImage.createFromDataURL(dataUrl);
     if (image.isEmpty()) return { success: false, message: '截图数据无效' };
     if (payload?.editPinId) {
       const editPinId = String(payload.editPinId);
@@ -1263,7 +1419,7 @@ ipcMain.handle('screenshot:save', (_event, payload) => {
       if (!pinWindow || pinWindow.isDestroyed() || currentCapture?.editPinId !== editPinId) {
         return { success: false, message: '要标记的贴图已关闭' };
       }
-      const updated = updatePinImage(pinWindow, dataUrl, { notifyRenderer: true });
+      const updated = updatePinImage(pinWindow, { bytes: imageBytes, dataUrl }, { notifyRenderer: true });
       if (!updated.success) return updated;
       if (payload?.copy !== false) clipboard.writeImage(image);
       screenshotWindow?.hide();
@@ -1273,9 +1429,9 @@ ipcMain.handle('screenshot:save', (_event, payload) => {
       return { success: true, id: editPinId, editedPin: true };
     }
     const pngMarker = 'data:image/png;base64,';
-    const pngBuffer = dataUrl.startsWith(pngMarker) ? Buffer.from(dataUrl.slice(pngMarker.length), 'base64') : undefined;
+    const pngBuffer = imageBytes || (dataUrl.startsWith(pngMarker) ? Buffer.from(dataUrl.slice(pngMarker.length), 'base64') : undefined);
     const entry = addImage(image, {
-      formats: ['image/png'], origin: 'screenshot', force: true, asyncWrite: true, pngBuffer,
+      formats: ['image/png'], origin: 'screenshot', force: true, pngBuffer,
     });
     traceScreenshotTiming('save-history-queued');
     if (!entry) return { success: false, message: '截图没有变化' };
@@ -1283,7 +1439,7 @@ ipcMain.handle('screenshot:save', (_event, payload) => {
     if (payload?.pin) {
       const exactBounds = currentCapture ? capturePinBounds(currentCapture.display.bounds, currentCapture.sourceSize, payload?.crop) : null;
       screenshotWindow?.hide();
-      const pinResult = openPinWindow(entry, { bounds: exactBounds, image, imageUrl: dataUrl });
+      const pinResult = openPinWindow(entry, { bounds: exactBounds, image, imageBytes: pngBuffer });
       traceScreenshotTiming('pin-window-prepared');
       if (!pinResult?.success) return pinResult;
     } else {
@@ -1303,13 +1459,19 @@ ipcMain.handle('screenshot:reselect', () => {
   return { success: true };
 });
 ipcMain.handle('screenshot:get-history', () => ({
-  entries: state.entries.filter(isScreenshotEntry).map((entry) => ({ ...publicEntry(entry), imageUrl: fullImageDataUrl(entry) })),
+  // Thumbnails only; the history window fetches each full image on demand.
+  entries: state.entries.filter(isScreenshotEntry).map((entry) => publicEntry(entry)),
   pinnedIds: [...pinWindows.keys()],
   historyPinShortcut: state.screenshotShortcuts.historyPin,
 }));
+ipcMain.handle('screenshot:open-history', () => {
+  showScreenshotHistory();
+  return { success: true };
+});
 ipcMain.handle('screenshot:get-entry', (_event, id) => {
   const entry = state.entries.find((item) => item.id === id && item.type === 'image');
-  return entry ? { ...publicEntry(entry), imageUrl: fullImageDataUrl(entry) } : null;
+  if (!entry) return null;
+  return { ...publicEntry(entry), imageBytes: safeReadImageFile(entry.imagePath) };
 });
 ipcMain.handle('screenshot:pin', (_event, id) => {
   const entry = state.entries.find((item) => item.id === id && item.type === 'image');
@@ -1332,7 +1494,10 @@ ipcMain.on('screenshot:show-pin-menu', showPinContextMenu);
 ipcMain.handle('screenshot:update-pin-image', (event, payload) => {
   const pinWindow = pinWindows.get(payload?.id);
   if (!pinWindow || pinWindow.isDestroyed() || event.sender !== pinWindow.webContents) return { success: false, message: '贴图已关闭' };
-  return updatePinImage(pinWindow, payload?.dataUrl);
+  // The renderer sends an ArrayBuffer (Blob#arrayBuffer), which structured
+  // clone delivers as-is — not as a Uint8Array — so normalize both shapes.
+  const bytes = coerceImageBytes(payload?.imageBytes);
+  return updatePinImage(pinWindow, { bytes, dataUrl: payload?.dataUrl });
 });
 ipcMain.handle('screenshot:recognize-pin-text', async (event, id) => {
   const pinWindow = pinWindows.get(id);
@@ -1341,7 +1506,7 @@ ipcMain.handle('screenshot:recognize-pin-text', async (event, id) => {
   }
   try {
     return await pinOcrCache.get(id, {
-      dataUrl: pinWindow.__pinImageDataUrl || '',
+      bytes: pinWindow.__pinImageBuffer || null,
       imagePath: pinWindow.__pinImagePath,
     });
   } catch (error) {
@@ -1364,6 +1529,11 @@ ipcMain.handle('screenshot:zoom-pin', (event, payload) => {
   if (!pinWindow || pinWindow.isDestroyed() || event.sender !== pinWindow.webContents) return { success: false, message: '贴图已关闭' };
   return zoomPinWindow(pinWindow, payload);
 });
+ipcMain.handle('screenshot:set-pin-opacity', (event, payload) => {
+  const pinWindow = pinWindows.get(payload?.id);
+  if (!pinWindow || pinWindow.isDestroyed() || event.sender !== pinWindow.webContents) return { success: false, message: '贴图已关闭' };
+  return setPinWindowOpacity(pinWindow, payload?.opacity);
+});
 ipcMain.on('screenshot:move-pin', (event, payload) => {
   const pinWindow = pinWindows.get(payload?.id);
   if (!pinWindow || pinWindow.isDestroyed() || event.sender !== pinWindow.webContents) return;
@@ -1385,11 +1555,11 @@ ipcMain.on('pin:image-ready', (event, id) => {
   if (!pinWindow || pinWindow.isDestroyed() || pinWindow.__pinEntryId !== id) return;
   traceScreenshotTiming('pin-image-ready');
   revealPinWindow(pinWindow, id);
-  const imageDataUrl = pinWindow.__pinImageDataUrl || '';
+  const imageBytes = pinWindow.__pinImageBuffer || null;
   const imagePath = pinWindow.__pinImagePath;
   setTimeout(() => {
     if (pinWindow.isDestroyed() || pinWindows.get(id) !== pinWindow) return;
-    void pinOcrCache.get(id, { dataUrl: imageDataUrl, imagePath }).catch(() => {});
+    void pinOcrCache.get(id, { bytes: imageBytes, imagePath }).catch(() => {});
   }, 120);
 });
 ipcMain.on('screenshot:editor-close', closeScreenshotEditorTask);
@@ -1414,6 +1584,23 @@ ipcMain.on('app:quit', () => {
 
 app.on('second-instance', showWindow);
 
+app.on('before-quit', (event) => {
+  if (shutdownReady) return;
+  event.preventDefault();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  app.isQuitting = true;
+  clearInterval(pollTimer);
+  // Drain disk work before the synchronous final store flush. Otherwise an
+  // old async rename can overwrite it, or a referenced PNG can be incomplete.
+  void (async () => {
+    while (pendingImageWrites.size) await Promise.allSettled([...pendingImageWrites]);
+    await storeWriteQueue;
+    shutdownReady = true;
+    app.quit();
+  })();
+});
+
 if (hasSingleInstanceLock) app.whenReady().then(() => {
   app.setAppUserModelId('com.local.pasty');
   loadStore();
@@ -1425,19 +1612,20 @@ if (hasSingleInstanceLock) app.whenReady().then(() => {
   createTray();
   ensureWarmPinWindow();
   setTimeout(() => { void prewarmDesktopCapture(); }, 350);
-  registerAppShortcut(state.shortcut || DEFAULT_SHORTCUT);
+  registerAppShortcut(state.shortcut || DEFAULT_SHORTCUT, { persist: false });
   registerScreenshotShortcuts(state.screenshotShortcuts, { persist: false });
+  trimHistory();
+  scheduleImageGc(1500);
   inspectClipboard();
-  pollTimer = setInterval(inspectClipboard, POLL_INTERVAL);
+  pollTimer = setInterval(() => { void pollClipboard(); }, POLL_INTERVAL);
 });
 
 app.on('will-quit', () => {
+  shortcutHold.stop();
   clearInterval(pollTimer);
   writeStore();
   windowsBridge.stop();
   pinOcrCache.clear();
-  paddleOcrService?.terminate();
-  void ocrService?.terminate();
   globalShortcut.unregisterAll();
   tray?.destroy();
   tray = null;

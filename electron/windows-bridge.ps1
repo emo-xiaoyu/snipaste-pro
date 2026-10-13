@@ -1,6 +1,7 @@
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 
 Add-Type -TypeDefinition @'
 using System;
@@ -19,6 +20,8 @@ public static class PastyWindowsBridge {
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT point);
   [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT point, uint flags);
   [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
+  [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
   [StructLayout(LayoutKind.Sequential)] public struct MONITORINFO {
@@ -146,6 +149,36 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     $result = switch ($request.op) {
       'foreground' { [PastyWindowsBridge]::Foreground(); break }
       'foregroundWithBounds' { [PastyWindowsBridge]::ForegroundWithBounds(); break }
+      'clipboardSequence' { [PastyWindowsBridge]::GetClipboardSequenceNumber(); break }
+      'keysDown' {
+        $down = $true
+        foreach ($group in $request.groups) {
+          $groupDown = $false
+          foreach ($key in $group) {
+            if (([PastyWindowsBridge]::GetAsyncKeyState([int]$key) -band 0x8000) -ne 0) { $groupDown = $true }
+          }
+          if (!$groupDown) { $down = $false; break }
+        }
+        $down
+        break
+      }
+      'readFiles' {
+        $files = @(if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
+          @([System.Windows.Forms.Clipboard]::GetFileDropList())
+        })
+        Write-Output -NoEnumerate $files
+        break
+      }
+      'writeFiles' {
+        $files = [System.Collections.Specialized.StringCollection]::new()
+        foreach ($file in $request.files) {
+          if (![string]::IsNullOrWhiteSpace([string]$file)) { [void]$files.Add([string]$file) }
+        }
+        if (!$files.Count) { throw 'File list is empty' }
+        [System.Windows.Forms.Clipboard]::SetFileDropList($files)
+        $true
+        break
+      }
       'paste' {
         $target = if ([string]::IsNullOrWhiteSpace([string]$request.target)) { 0L } else { [Convert]::ToInt64([string]$request.target) }
         $delay = [Math]::Max(0, [Math]::Min(1200, [int]$request.delayMs))

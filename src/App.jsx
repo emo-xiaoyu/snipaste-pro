@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Add20Regular,
+  ArrowLeft20Regular,
   Code20Regular,
   Delete20Regular,
   Dismiss20Regular,
@@ -14,6 +15,8 @@ import {
   TextDescription20Regular,
 } from '@fluentui/react-icons';
 import { acceleratorFromEvent } from './shortcut-utils.js';
+import { applyClipboardDelta } from './state-merge.js';
+import { LauncherWheel } from './LauncherWheel.jsx';
 
 const demoEntries = [
   { id: 'demo-1', type: 'code', title: 'npm run dev', content: 'npm run dev', createdAt: Date.now() - 1000, pinned: true },
@@ -26,6 +29,7 @@ const demoEntries = [
 
 const tabs = [
   { id: 'recent', label: '最近' },
+  { id: 'text', label: '文字' },
   { id: 'pinned', label: '常用' },
   { id: 'image', label: '图片' },
 ];
@@ -85,10 +89,19 @@ function useClipboardState() {
       setPreferences({ ...defaultPreferences, ...(next.preferences || {}) });
     });
     return api.onStateChanged((next) => {
-      setEntries(next.entries || []);
-      setShortcut(next.shortcut || 'Alt+V');
-      setScreenshotShortcuts({ ...defaultScreenshotShortcuts, ...(next.screenshotShortcuts || {}) });
-      setPreferences({ ...defaultPreferences, ...(next.preferences || {}) });
+      if (next.full) {
+        setEntries(next.entries || []);
+        setShortcut(next.shortcut || 'Alt+V');
+        setScreenshotShortcuts({ ...defaultScreenshotShortcuts, ...(next.screenshotShortcuts || {}) });
+        setPreferences({ ...defaultPreferences, ...(next.preferences || {}) });
+      } else {
+        if (next.shortcut) setShortcut(next.shortcut);
+        if (next.screenshotShortcuts) setScreenshotShortcuts({ ...defaultScreenshotShortcuts, ...next.screenshotShortcuts });
+        if (next.preferences) setPreferences({ ...defaultPreferences, ...next.preferences });
+        if (next.capturedEntry || next.updatedEntry || (next.removedIds && next.removedIds.length)) {
+          setEntries((current) => applyClipboardDelta(current, next));
+        }
+      }
       if (next.notice) setNotice(next.notice);
     });
   }, [api]);
@@ -305,17 +318,26 @@ function SettingsDialog({ initialShortcut, initialScreenshotShortcuts, initialPr
 
 export function App() {
   const { api, entries, setEntries, shortcut, setShortcut, screenshotShortcuts, setScreenshotShortcuts, preferences, setPreferences, notice, setNotice } = useClipboardState();
+  const [screen, setScreen] = useState('launcher');
+  const [launcherSelection, setLauncherSelection] = useState(0);
+  const [launcherSession, setLauncherSession] = useState(0);
   const [tab, setTab] = useState('recent');
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState(0);
   const [addOpen, setAddOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const searchRef = useRef(null);
+  const launcherOptionsRef = useRef([]);
+  const launcherControlsRef = useRef(null);
+  const windowModeRef = useRef('launcher');
+  const launcherHoldRef = useRef(null);
+  const launcherInvocationRef = useRef(0);
 
   const filtered = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase('zh-CN');
     return entries.filter((entry) => {
       if (tab === 'pinned' && !entry.pinned) return false;
+      if (tab === 'text' && entry.type === 'image') return false;
       if (tab === 'image' && entry.type !== 'image') return false;
       if (!normalized) return true;
       return `${entry.title || ''} ${entry.content || ''} ${(entry.files || []).join(' ')} ${entry.source?.app || ''} ${entry.source?.title || ''}`.toLocaleLowerCase('zh-CN').includes(normalized);
@@ -325,12 +347,58 @@ export function App() {
   useEffect(() => setSelected(0), [query, tab]);
   useEffect(() => {
     if (!api) return undefined;
-    return api.onFocusSearch(() => {
-      setTimeout(() => searchRef.current?.focus(), 40);
+    return api.onOpenLauncher((invocation) => {
+      launcherInvocationRef.current += 1;
+      launcherHoldRef.current = invocation?.shortcutKeys ? { keys: invocation.shortcutKeys, sessionId: invocation.shortcutSession, released: false } : null;
+      // The main process already applied launcher bounds for this invocation.
+      windowModeRef.current = 'launcher';
+      setScreen('launcher');
+      setLauncherSelection(0);
+      setLauncherSession((current) => current + 1);
+      window.requestAnimationFrame(() => launcherOptionsRef.current[0]?.focus());
     });
   }, [api]);
 
-  const activeEntry = filtered[Math.min(selected, Math.max(0, filtered.length - 1))];
+  useEffect(() => {
+    if (!api) return undefined;
+    const release = () => {
+      const hold = launcherHoldRef.current;
+      if (!hold || hold.released) return;
+      hold.released = true;
+      launcherInvocationRef.current += 1;
+      launcherControlsRef.current?.cancel();
+    };
+    const keyUp = (event) => {
+      if (!launcherHoldRef.current?.keys.includes(event.keyCode)) return;
+      release();
+      api.releaseLauncherShortcut();
+    };
+    const off = api.onLauncherShortcutReleased(release);
+    window.addEventListener('keyup', keyUp);
+    return () => { off(); window.removeEventListener('keyup', keyUp); };
+  }, [api]);
+
+  useEffect(() => {
+    if (screen === 'clipboard') searchRef.current?.focus({ preventScroll: true });
+    else launcherOptionsRef.current[launcherSelection]?.focus();
+  }, [screen]);
+
+  useEffect(() => {
+    if (!api || windowModeRef.current === screen) return undefined;
+    windowModeRef.current = screen;
+    // Present the new page before resizing the native surface. Otherwise the
+    // compositor can briefly display the old wheel at the new window bounds.
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => { void api.setWindowMode(screen); });
+    });
+    return () => {
+      window.cancelAnimationFrame(firstFrame);
+      window.cancelAnimationFrame(secondFrame);
+    };
+  }, [api, screen]);
+
+  const activeEntry = filtered[Math.max(0, Math.min(selected, filtered.length - 1))];
 
   async function paste(entry = activeEntry) {
     if (!entry) return;
@@ -395,11 +463,76 @@ export function App() {
     return { success: true };
   }
 
+  function openClipboardTab(nextTab) {
+    setQuery('');
+    setSelected(0);
+    setTab(nextTab);
+    setScreen('clipboard');
+  }
+
+  function openTextHistory() { openClipboardTab('text'); }
+
+  function returnToLauncher() {
+    setScreen('launcher');
+  }
+
+  async function openScreenshotHistory() {
+    if (!api) {
+      setNotice('截图历史请在桌面版中查看');
+      return;
+    }
+    const result = await api.openScreenshotHistory();
+    if (result?.success === false) setNotice(result.message || '无法打开截图历史');
+  }
+
+  async function openLauncherOption(index) {
+    const hold = launcherHoldRef.current;
+    if (hold?.released) return;
+    const invocation = launcherInvocationRef.current;
+    if (api) {
+      const result = await api.activateLauncher(hold?.sessionId ?? null);
+      if (!result.success || invocation !== launcherInvocationRef.current) return;
+    }
+    launcherHoldRef.current = null;
+    if (index === 0) openTextHistory();
+    else if (index === 1) void openScreenshotHistory();
+    else if (index === 2) openClipboardTab('image');
+    else if (index === 3) openClipboardTab('pinned');
+  }
+
   function handleKeys(event) {
     if (addOpen || settingsOpen) return;
+    if (screen === 'launcher') {
+      if (['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
+        event.preventDefault();
+        launcherControlsRef.current?.cancel();
+        const next = {
+          ArrowUp: 0,
+          ArrowRight: 1,
+          ArrowDown: 2,
+          ArrowLeft: 3,
+        }[event.key];
+        setLauncherSelection(next);
+        window.requestAnimationFrame(() => launcherOptionsRef.current[next]?.focus());
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        launcherControlsRef.current?.cancel();
+        openLauncherOption(launcherSelection);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        launcherControlsRef.current?.cancel();
+        api?.hideWindow();
+      }
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      returnToLauncher();
+      return;
+    }
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      setSelected((current) => Math.min(current + 1, filtered.length - 1));
+      setSelected((current) => Math.max(0, Math.min(current + 1, filtered.length - 1)));
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
       setSelected((current) => Math.max(0, current - 1));
@@ -412,94 +545,103 @@ export function App() {
     } else if ((event.ctrlKey || event.metaKey) && event.key === ',') {
       event.preventDefault();
       setSettingsOpen(true);
-    } else if (event.key === 'Escape') {
-      api?.hideWindow();
     }
   }
 
+  const handleKeysRef = useRef(null);
+  handleKeysRef.current = handleKeys;
   useEffect(() => {
-    window.addEventListener('keydown', handleKeys);
-    return () => window.removeEventListener('keydown', handleKeys);
-  });
+    const listener = (event) => handleKeysRef.current(event);
+    window.addEventListener('keydown', listener);
+    return () => window.removeEventListener('keydown', listener);
+  }, []);
 
   return (
-    <main className="app-stage">
-      <section className="clipboard-shell" aria-label="Pasty 剪贴板">
-        <header className="topbar">
-          <div className="search-wrap">
-            <Search24Regular aria-hidden="true" />
-            <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索剪贴板或常用内容" aria-label="搜索剪贴板" autoFocus />
-            <kbd>Ctrl K</kbd>
-          </div>
-          <div className="topbar-actions">
-            <button className="add-button" onClick={() => setAddOpen(true)} title="添加常用内容"><Add20Regular /><span>添加</span></button>
-            <button type="button" className="icon-button window-close-button" onClick={() => api?.hideWindow()} aria-label="关闭主窗口" title="关闭窗口 · Esc"><Dismiss20Regular /></button>
-          </div>
-        </header>
-
-        <nav className="tabs" aria-label="剪贴板分类">
-          {tabs.map((item) => (
-            <button key={item.id} className={tab === item.id ? 'tab is-active' : 'tab'} onClick={() => setTab(item.id)}>{item.label}</button>
-          ))}
-        </nav>
-
-        <div className="list-heading">
-          <span>{tab === 'recent' ? '最近复制' : tab === 'pinned' ? '我的常用' : '图片记录'}</span>
-          <span>{filtered.length} 项</span>
-        </div>
-
-        <div className="entry-list" role="listbox" aria-label="剪贴板内容">
-          {filtered.map((entry, index) => {
-            const isSelected = index === selected;
-            return (
-              <article
-                key={entry.id}
-                className={isSelected ? 'entry-row is-selected' : 'entry-row'}
-                role="option"
-                aria-selected={isSelected}
-                onMouseEnter={() => setSelected(index)}
-                onDoubleClick={() => paste(entry)}
-              >
-                {entry.type === 'image' && entry.imageUrl ? (
-                  <img className="entry-thumbnail" src={entry.imageUrl} alt="剪贴板图片预览" />
-                ) : <EntryIcon type={entry.type} />}
-                <button className="entry-content" onClick={() => { setSelected(index); paste(entry); }}>
-                  <strong>{entry.title || entry.content}</strong>
-                  <span className="entry-meta">
-                    <span>{typeMeta[entry.type]?.label || '文本'}</span>
-                    <span className="meta-dot" />
-                    <span>{relativeTime(entry.createdAt)}</span>
-                    {entry.type === 'image' && <><span className="meta-dot" /><span>{entry.content}</span></>}
-                    {entry.source?.app && <><span className="meta-dot" /><span title={entry.source.title || ''}>来自 {entry.source.app}</span></>}
-                    {entry.copyCount > 1 && <><span className="meta-dot" /><span>复制 {entry.copyCount} 次</span></>}
-                  </span>
-                </button>
-                <div className="entry-actions">
-                  <button className={entry.pinned ? 'icon-button pin is-pinned' : 'icon-button pin'} onClick={() => togglePin(entry)} aria-label={entry.pinned ? '取消固定' : '固定'} title={entry.pinned ? '取消固定' : '固定'}>
-                    {entry.pinned ? <Pin20Filled /> : <Pin20Regular />}
-                  </button>
-                  <button className="icon-button delete" onClick={() => remove(entry)} aria-label="删除" title="删除"><Delete20Regular /></button>
-                </div>
-              </article>
-            );
-          })}
-
-          {!filtered.length && (
-            <div className="empty-state">
-              <Search24Regular />
-              <strong>{query ? '没有找到匹配内容' : '这里还是空的'}</strong>
-              <span>{query ? '换一个关键词试试' : '复制文本、图片或文件后，它会自动出现在这里'}</span>
+    <main className={screen === 'launcher' ? 'app-stage app-stage--launcher' : 'app-stage'}>
+      {screen === 'launcher' ? (
+        <section className="clipboard-shell clipboard-shell--launcher" aria-label="Pasty 快捷入口">
+          <LauncherWheel key={launcherSession} selection={launcherSelection} onSelectionChange={setLauncherSelection}
+            onOpen={openLauncherOption} optionRefs={launcherOptionsRef} controlsRef={launcherControlsRef} />
+        </section>
+      ) : (
+        <section className="clipboard-shell" aria-label="Pasty 剪贴板">
+          <header className="topbar topbar--content">
+            <button type="button" className="launcher-back" onClick={returnToLauncher} aria-label="返回快捷入口" title="返回快捷入口"><ArrowLeft20Regular /><span>入口</span></button>
+            <div className="search-wrap">
+              <Search24Regular aria-hidden="true" />
+              <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索剪贴板或常用内容" aria-label="搜索剪贴板" />
+              <kbd>Ctrl K</kbd>
             </div>
-          )}
-        </div>
+            <div className="topbar-actions">
+              <button className="add-button" onClick={() => setAddOpen(true)} title="添加常用内容"><Add20Regular /><span>添加</span></button>
+              <button type="button" className="icon-button window-close-button" onClick={() => api?.hideWindow()} aria-label="关闭主窗口" title="关闭窗口 · Esc"><Dismiss20Regular /></button>
+            </div>
+          </header>
 
-        <footer className="footer-bar">
-          <div className="key-help"><kbd>↑</kbd><kbd>↓</kbd><span>选择</span></div>
-          <div className="key-help"><kbd>Enter</kbd><span>粘贴</span></div>
-          <div className="key-help"><kbd>Ctrl P</kbd><span>固定</span></div>
-          <button className="settings-button settings-button--labeled" onClick={() => setSettingsOpen(true)} title={`快捷键与设置 · ${shortcut}`}><Settings20Regular /><span>快捷键</span></button>
-        </footer>
-      </section>
+          <nav className="tabs" aria-label="剪贴板分类">
+            {tabs.map((item) => (
+              <button key={item.id} className={tab === item.id ? 'tab is-active' : 'tab'} onClick={() => setTab(item.id)}>{item.label}</button>
+            ))}
+          </nav>
+
+          <div className="list-heading">
+            <span>{tab === 'recent' ? '最近复制' : tab === 'text' ? '文字内容' : tab === 'pinned' ? '我的常用' : '图片记录'}</span>
+            <span>{filtered.length} 项</span>
+          </div>
+
+          <div className="entry-list" role="listbox" aria-label="剪贴板内容">
+            {filtered.map((entry, index) => {
+              const isSelected = index === selected;
+              return (
+                <article
+                  key={entry.id}
+                  className={isSelected ? 'entry-row is-selected' : 'entry-row'}
+                  role="option"
+                  aria-selected={isSelected}
+                  onMouseEnter={() => setSelected(index)}
+                  onDoubleClick={() => paste(entry)}
+                >
+                  {entry.type === 'image' && entry.imageUrl ? (
+                    <img className="entry-thumbnail" src={entry.imageUrl} alt="剪贴板图片预览" loading="lazy" />
+                  ) : <EntryIcon type={entry.type} />}
+                  <button className="entry-content" onClick={() => { setSelected(index); paste(entry); }}>
+                    <strong>{entry.title || entry.content}</strong>
+                    <span className="entry-meta">
+                      <span>{typeMeta[entry.type]?.label || '文本'}</span>
+                      <span className="meta-dot" />
+                      <span>{relativeTime(entry.createdAt)}</span>
+                      {entry.type === 'image' && <><span className="meta-dot" /><span>{entry.content}</span></>}
+                      {entry.source?.app && <><span className="meta-dot" /><span title={entry.source.title || ''}>来自 {entry.source.app}</span></>}
+                      {entry.copyCount > 1 && <><span className="meta-dot" /><span>复制 {entry.copyCount} 次</span></>}
+                    </span>
+                  </button>
+                  <div className="entry-actions">
+                    <button className={entry.pinned ? 'icon-button pin is-pinned' : 'icon-button pin'} onClick={() => togglePin(entry)} aria-label={entry.pinned ? '取消固定' : '固定'} title={entry.pinned ? '取消固定' : '固定'}>
+                      {entry.pinned ? <Pin20Filled /> : <Pin20Regular />}
+                    </button>
+                    <button className="icon-button delete" onClick={() => remove(entry)} aria-label="删除" title="删除"><Delete20Regular /></button>
+                  </div>
+                </article>
+              );
+            })}
+
+            {!filtered.length && (
+              <div className="empty-state">
+                <Search24Regular />
+                <strong>{query ? '没有找到匹配内容' : '这里还是空的'}</strong>
+                <span>{query ? '换一个关键词试试' : tab === 'text' ? '复制的文字、指令和网址会自动出现在这里' : '复制文本、图片或文件后，它会自动出现在这里'}</span>
+              </div>
+            )}
+          </div>
+
+          <footer className="footer-bar">
+            <div className="key-help"><kbd>↑</kbd><kbd>↓</kbd><span>选择</span></div>
+            <div className="key-help"><kbd>Enter</kbd><span>粘贴</span></div>
+            <div className="key-help"><kbd>Ctrl P</kbd><span>固定</span></div>
+            <button className="settings-button settings-button--labeled" onClick={() => setSettingsOpen(true)} title={`快捷键与设置 · ${shortcut}`}><Settings20Regular /><span>快捷键</span></button>
+          </footer>
+        </section>
+      )}
 
       {notice && <div className="toast" role="status">{notice}</div>}
       {addOpen && <AddDialog onClose={() => setAddOpen(false)} onSubmit={createEntry} />}
