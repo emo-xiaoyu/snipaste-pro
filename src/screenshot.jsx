@@ -3,10 +3,13 @@ import { createRoot } from 'react-dom/client';
 import {
   ArrowRedo20Regular,
   ArrowUndo20Regular,
+  Blur20Regular,
   Copy20Regular,
   Crop20Regular,
   Dismiss20Regular,
   DrawShape20Regular,
+  GridDots20Regular,
+  Highlight20Regular,
   Line20Regular,
   Pin20Regular,
   Save20Regular,
@@ -15,8 +18,12 @@ import {
 } from '@fluentui/react-icons';
 import './screenshot.css';
 import {
+  formatColorValue,
+  highlighterLineWidth,
+  invalidateRedactionCache,
   normalizedRect,
   pointInsideRect,
+  redactBrushWidth,
   renderStrokes,
   TEXT_FONT_FAMILY,
   TEXT_LINE_HEIGHT,
@@ -30,10 +37,19 @@ const api = window.clipboardAPI;
 const MIN_SELECTION = 24;
 const COLORS = ['#ef493f', '#ff9f1c', '#ffe066', '#4ea86b', '#2f80ed', '#161a16', '#ffffff'];
 const WIDTHS = [3, 6, 10];
+const FREEHAND_TOOLS = new Set(['pen', 'highlighter', 'mosaic', 'blur']);
+const REDACTION_TOOLS = new Set(['mosaic', 'blur']);
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
+
+// One shared 1×1 sampler for the live color readout; allocating a canvas
+// per pointermove showed up as steady GC churn during selection drags.
+const samplerCanvas = document.createElement('canvas');
+samplerCanvas.width = 1;
+samplerCanvas.height = 1;
+const samplerContext = samplerCanvas.getContext('2d', { willReadFrequently: true });
 
 function resizeSelection(origin, handle, current, image) {
   let left = origin.x;
@@ -49,12 +65,9 @@ function resizeSelection(origin, handle, current, image) {
 
 function samplePixel(image, current) {
   if (!image || !current) return null;
-  const sampler = document.createElement('canvas');
-  sampler.width = 1;
-  sampler.height = 1;
-  const context = sampler.getContext('2d', { willReadFrequently: true });
-  context.drawImage(image, Math.floor(current.x), Math.floor(current.y), 1, 1, 0, 0, 1, 1);
-  const [r, g, b] = context.getImageData(0, 0, 1, 1).data;
+  samplerContext.clearRect(0, 0, 1, 1);
+  samplerContext.drawImage(image, Math.floor(current.x), Math.floor(current.y), 1, 1, 0, 0, 1, 1);
+  const [r, g, b] = samplerContext.getImageData(0, 0, 1, 1).data;
   const hex = `#${[r, g, b].map((value) => value.toString(16).padStart(2, '0')).join('')}`.toUpperCase();
   return { r, g, b, hex };
 }
@@ -65,6 +78,7 @@ function ScreenshotEditor() {
   const selectionRef = useRef(null);
   const actionRef = useRef(null);
   const finishingRef = useRef(false);
+  const finishRef = useRef(null);
   const followingSelectionRef = useRef(false);
   const strokesRef = useRef([]);
   const textDraftRef = useRef(null);
@@ -72,6 +86,9 @@ function ScreenshotEditor() {
   const captureLoadRef = useRef(0);
   const objectUrlRef = useRef('');
   const toolbarRef = useRef(null);
+  const pointerFrameRef = useRef(0);
+  const pendingPointerInfoRef = useRef(null);
+  const canvasFrameRef = useRef(0);
   const [imageSize, setImageSize] = useState(null);
   const [selection, setSelectionState] = useState(null);
   const [autoSelection, setAutoSelection] = useState(null);
@@ -83,10 +100,16 @@ function ScreenshotEditor() {
   const [color, setColor] = useState(COLORS[0]);
   const [lineWidth, setLineWidth] = useState(WIDTHS[1]);
   const [pointerInfo, setPointerInfo] = useState(null);
+  const [colorFormat, setColorFormat] = useState('hex');
+  const [copyToast, setCopyToast] = useState(null);
+  const colorFormatRef = useRef('hex');
+  colorFormatRef.current = colorFormat;
+  const pointerInfoRef = useRef(null);
+  const copyToastTimerRef = useRef(null);
   const [followingSelection, setFollowingSelectionState] = useState(false);
   const [editPinId, setEditPinId] = useState(null);
   const [contentInset, setContentInset] = useState(null);
-  const [toolbarSize, setToolbarSize] = useState({ width: 540, height: 48 });
+  const [toolbarSize, setToolbarSize] = useState({ width: 656, height: 48 });
   strokesRef.current = strokes;
 
   function setSelection(next) {
@@ -119,6 +142,9 @@ function ScreenshotEditor() {
     setFollowingSelection(task.followSelection === false ? false : Boolean(preset));
     setTool(task.initialTool || 'select');
     setPointerInfo(null);
+    pointerInfoRef.current = null;
+    setCopyToast(null);
+    if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
     finishingRef.current = false;
     setEditPinId(task.editPinId || null);
     setContentInset(task.contentInset || null);
@@ -177,10 +203,42 @@ function ScreenshotEditor() {
       unsubscribe?.();
       captureLoadRef.current += 1;
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
+      if (pointerFrameRef.current) cancelAnimationFrame(pointerFrameRef.current);
+      if (canvasFrameRef.current) cancelAnimationFrame(canvasFrameRef.current);
+      if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
     };
   }, []);
 
-  useEffect(() => api?.onScreenshotPinRequest(() => finish(true, true)), []);
+  function cycleColorFormat() {
+    const formats = ['hex', 'rgb', 'hsl'];
+    const nextIndex = (formats.indexOf(colorFormatRef.current) + 1) % formats.length;
+    const next = formats[nextIndex];
+    colorFormatRef.current = next;
+    setColorFormat(next);
+  }
+
+  async function copyCurrentColor() {
+    const pixel = pointerInfoRef.current;
+    if (!pixel) return;
+    const formatted = formatColorValue(pixel, colorFormatRef.current);
+    try {
+      if (api?.writeClipboardText) {
+        await api.writeClipboardText(formatted);
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(formatted);
+      }
+      if (copyToastTimerRef.current) clearTimeout(copyToastTimerRef.current);
+      setCopyToast({ value: formatted, hex: pixel.hex });
+      copyToastTimerRef.current = setTimeout(() => {
+        setCopyToast(null);
+      }, 1600);
+    } catch (err) {
+      console.warn('Could not copy color:', err);
+    }
+  }
+
+  finishRef.current = finish;
+  useEffect(() => api?.onScreenshotPinRequest(() => finishRef.current(true, true)), []);
 
   useEffect(draw, [selection, strokes, imageSize, tool]);
 
@@ -237,6 +295,13 @@ function ScreenshotEditor() {
       else if (event.ctrlKey && key === 'p' && selectionRef.current) { event.preventDefault(); finish(true, true); }
       else if (event.ctrlKey && (key === 'y' || (event.shiftKey && key === 'z'))) { event.preventDefault(); redo(); }
       else if (event.ctrlKey && key === 'z') { event.preventDefault(); undo(); }
+      else if (key === 'c' && !event.ctrlKey && !event.altKey && !event.metaKey && !event.repeat && pointerInfoRef.current) {
+        event.preventDefault();
+        copyCurrentColor();
+      }
+      else if (event.key === 'Shift' && !event.repeat && !event.ctrlKey && !event.altKey && !event.metaKey && pointerInfoRef.current) {
+        cycleColorFormat();
+      }
       else if (['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key) && selectionRef.current && !strokes.length) {
         event.preventDefault();
         nudgeSelection(key, event.shiftKey);
@@ -244,7 +309,7 @@ function ScreenshotEditor() {
     };
     window.addEventListener('keydown', keys);
     return () => window.removeEventListener('keydown', keys);
-  }, [selection, strokes, redoStrokes]);
+  }, [selection, strokes, redoStrokes, editPinId]);
 
   function point(event) {
     const canvas = canvasRef.current;
@@ -257,7 +322,24 @@ function ScreenshotEditor() {
 
   function updatePointer(current, event) {
     const pixel = samplePixel(imageRef.current, current);
-    setPointerInfo({ ...current, ...pixel, clientX: event.clientX, clientY: event.clientY });
+    const info = { ...current, ...pixel, clientX: event.clientX, clientY: event.clientY };
+    pendingPointerInfoRef.current = info;
+    pointerInfoRef.current = info;
+    if (pointerFrameRef.current) return;
+    pointerFrameRef.current = requestAnimationFrame(() => {
+      pointerFrameRef.current = 0;
+      if (pendingPointerInfoRef.current) setPointerInfo(pendingPointerInfoRef.current);
+    });
+  }
+
+  // Live drawing mutates the in-progress stroke and repaints on the next
+  // frame; React state (toolbar, undo stack) only updates on pointer-up.
+  function scheduleCanvasRefresh() {
+    if (canvasFrameRef.current) return;
+    canvasFrameRef.current = requestAnimationFrame(() => {
+      canvasFrameRef.current = 0;
+      draw();
+    });
   }
 
   function handleAt(current) {
@@ -288,7 +370,7 @@ function ScreenshotEditor() {
     canvas.height = image.naturalHeight;
     const context = canvas.getContext('2d');
     context.drawImage(image, 0, 0);
-    renderStrokes(context, strokes);
+    renderStrokes(context, strokesRef.current, { source: image });
     if (selection) {
       context.save();
       context.fillStyle = 'rgba(15, 18, 14, .54)';
@@ -301,7 +383,7 @@ function ScreenshotEditor() {
 
   function beginStroke(current) {
     const base = { tool, color, lineWidth };
-    return tool === 'pen' ? { ...base, points: [current] } : { ...base, start: current, end: current };
+    return FREEHAND_TOOLS.has(tool) ? { ...base, points: [current] } : { ...base, start: current, end: current };
   }
 
   function cancelTextDraft() {
@@ -355,6 +437,7 @@ function ScreenshotEditor() {
       return;
     }
     actionRef.current = { type: 'draw', stroke: beginStroke(current) };
+    strokesRef.current = [...strokesRef.current, actionRef.current.stroke];
   }
 
   function onPointerMove(event) {
@@ -384,8 +467,9 @@ function ScreenshotEditor() {
       setTextBoxPreview(normalizedRect(action.start, action.end));
     }
     else {
-      if (action.stroke.tool === 'pen') action.stroke.points.push(current); else action.stroke.end = current;
-      setStrokes((items) => [...items.filter((item) => item !== action.stroke), action.stroke]);
+      if (FREEHAND_TOOLS.has(action.stroke.tool)) action.stroke.points.push(current); else action.stroke.end = current;
+      invalidateRedactionCache(action.stroke);
+      scheduleCanvasRefresh();
     }
   }
 
@@ -402,7 +486,10 @@ function ScreenshotEditor() {
     if (selectionRef.current?.width < MIN_SELECTION || selectionRef.current?.height < MIN_SELECTION) {
       setSelection(action?.type === 'select' ? action.fallback : null);
     }
-    if (action?.type === 'draw') setRedoStrokes([]);
+    if (action?.type === 'draw') {
+      setStrokes(strokesRef.current);
+      setRedoStrokes([]);
+    }
     actionRef.current = null;
   }
 
@@ -478,9 +565,20 @@ function ScreenshotEditor() {
     context.scale(output.width / crop.width, output.height / crop.height);
     context.translate(-crop.x, -crop.y);
     context.drawImage(image, 0, 0);
-    renderStrokes(context, strokesRef.current);
+    renderStrokes(context, strokesRef.current, { source: image });
     context.restore();
-    const result = await api?.saveScreenshot(output.toDataURL('image/png'), { pin, copy, crop, editPinId });
+    const blob = await new Promise((resolve) => output.toBlob(resolve, 'image/png'));
+    if (!blob) {
+      finishingRef.current = false;
+      return;
+    }
+    const result = await api?.saveScreenshot({
+      imageBytes: await blob.arrayBuffer(),
+      pin,
+      copy,
+      crop,
+      editPinId,
+    });
     if (result && !result.success) {
       finishingRef.current = false;
     }
@@ -499,9 +597,20 @@ function ScreenshotEditor() {
     ? selectionViewportRect(textDraft.rect, imageSize, editorViewport, contentInset || {})
     : null;
   const textScale = textDraftStyle && textDraft?.rect.width ? textDraftStyle.width / textDraft.rect.width : 1;
+  const redactionToolActive = REDACTION_TOOLS.has(tool);
+  const widthLabel = tool === 'text' ? '文字大小'
+    : tool === 'highlighter' ? '荧光笔粗细'
+    : tool === 'mosaic' ? '马赛克颗粒'
+    : tool === 'blur' ? '模糊强度'
+    : '线条粗细';
+  const widthPreviewHeight = (value) => {
+    if (tool === 'highlighter') return Math.max(3, highlighterLineWidth(value) / 4);
+    if (redactionToolActive) return Math.max(3, redactBrushWidth(value) / 4);
+    return Math.max(2, value / 2);
+  };
   const infoStyle = pointerInfo ? {
-    left: clamp(pointerInfo.clientX + 16, 8, window.innerWidth - 190),
-    top: clamp(pointerInfo.clientY + 18, 8, window.innerHeight - 70),
+    left: clamp(pointerInfo.clientX + 16, 8, window.innerWidth - 210),
+    top: clamp(pointerInfo.clientY + 18, 8, window.innerHeight - 88),
   } : null;
 
   return (
@@ -538,12 +647,26 @@ function ScreenshotEditor() {
         {['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map((handle) => <span className={`selection-handle selection-handle--${handle}`} key={handle} />)}
         <span className="selection-size">{Math.round(selection.width)} × {Math.round(selection.height)}</span>
       </div>}
+      {copyToast && (
+        <div className="copy-toast" role="status" aria-live="polite">
+          <span className="copy-toast-swatch" style={{ background: copyToast.hex }} />
+          <span>已复制颜色 <code>{copyToast.value}</code></span>
+        </div>
+      )}
       {pointerInfo && <div className="pixel-info" style={infoStyle}>
         <i style={{ background: pointerInfo.hex }} />
-        <span>{pointerInfo.hex}</span>
-        <small>RGB {pointerInfo.r}, {pointerInfo.g}, {pointerInfo.b}</small>
+        <div className="pixel-info-data">
+          <span className="pixel-info-code">{formatColorValue(pointerInfo, colorFormat)}</span>
+          <small className="pixel-info-secondary">
+            {colorFormat === 'hex' ? `RGB ${pointerInfo.r}, ${pointerInfo.g}, ${pointerInfo.b}` : pointerInfo.hex}
+          </small>
+        </div>
+        <div className="pixel-info-actions">
+          <span className="pixel-info-key">按 <b>C</b> 复制</span>
+          <span className="pixel-info-badge" title="按 Shift 切换格式">Shift: {colorFormat.toUpperCase()}</span>
+        </div>
       </div>}
-      {!selection && <div className="shot-hint"><Crop20Regular /><strong>拖动选择截图区域</strong><span>右键返回 · Esc 取消</span></div>}
+      {!selection && <div className="shot-hint"><Crop20Regular /><strong>拖动选择截图区域</strong><span>按 C 复制色值 · Shift 切换格式 · Esc 取消</span></div>}
       {selection && <div
         ref={toolbarRef}
         className={`shot-toolbar shot-toolbar--${toolbarLayout?.placement || 'below'}`}
@@ -551,18 +674,21 @@ function ScreenshotEditor() {
       >
         <button className={tool === 'select' ? 'active' : ''} disabled={strokes.length > 0} onClick={() => chooseTool('select')} title={strokes.length ? '已开始标注，选区已锁定' : '调整选区'}><Crop20Regular /></button>
         <button className={tool === 'pen' ? 'active' : ''} onClick={() => chooseTool('pen')} title="画笔"><Line20Regular /></button>
+        <button className={tool === 'highlighter' ? 'active' : ''} onClick={() => chooseTool('highlighter')} title="荧光笔"><Highlight20Regular /></button>
+        <button className={tool === 'mosaic' ? 'active' : ''} onClick={() => chooseTool('mosaic')} title="马赛克"><GridDots20Regular /></button>
+        <button className={tool === 'blur' ? 'active' : ''} onClick={() => chooseTool('blur')} title="模糊"><Blur20Regular /></button>
         <button className={tool === 'arrow' ? 'active' : ''} onClick={() => chooseTool('arrow')} title="箭头"><DrawShape20Regular /></button>
         <button className={tool === 'rect' ? 'active' : ''} onClick={() => chooseTool('rect')} title="矩形"><span className="rect-icon" /></button>
         <button className={tool === 'ellipse' ? 'active' : ''} onClick={() => chooseTool('ellipse')} title="椭圆"><span className="ellipse-icon" /></button>
         <button className={tool === 'text' ? 'active' : ''} onClick={() => chooseTool('text')} title="文字"><TextT20Regular /></button>
         <span className="separator" />
-        <div className="color-control" title="标注颜色">
-          <button className="color-trigger" aria-label="标注颜色"><i style={{ background: color }} /></button>
+        <div className={`color-control ${redactionToolActive ? 'color-control--disabled' : ''}`} title={redactionToolActive ? '马赛克/模糊不使用颜色' : '标注颜色'}>
+          <button className="color-trigger" aria-label="标注颜色" disabled={redactionToolActive}><i style={{ background: color }} /></button>
           <div className="color-popover">{COLORS.map((item) => <button key={item} className={color === item ? 'selected' : ''} style={{ '--swatch': item }} onClick={() => setColor(item)} aria-label={item} />)}</div>
         </div>
-        <div className="width-control" title={tool === 'text' ? '文字大小' : '线条粗细'}>
-          <button className={`width-trigger ${tool === 'text' ? 'width-trigger--text' : ''}`} aria-label={tool === 'text' ? '文字大小' : '线条粗细'}>{tool === 'text' ? <TextFontSize20Regular /> : <i style={{ height: Math.max(2, lineWidth / 2) }} />}</button>
-          <div className={`width-popover ${tool === 'text' ? 'width-popover--text' : ''}`}>{WIDTHS.map((item) => <button key={item} className={lineWidth === item ? 'selected' : ''} onClick={() => setLineWidth(item)}>{tool === 'text' ? <span style={{ fontSize: 10 + item }}>A</span> : <i style={{ height: Math.max(2, item / 2) }} />}</button>)}</div>
+        <div className="width-control" title={widthLabel}>
+          <button className={`width-trigger ${tool === 'text' ? 'width-trigger--text' : ''}`} aria-label={widthLabel}>{tool === 'text' ? <TextFontSize20Regular /> : <i style={{ height: widthPreviewHeight(lineWidth) }} />}</button>
+          <div className={`width-popover ${tool === 'text' ? 'width-popover--text' : ''}`}>{WIDTHS.map((item) => <button key={item} className={lineWidth === item ? 'selected' : ''} onClick={() => setLineWidth(item)}>{tool === 'text' ? <span style={{ fontSize: 10 + item }}>A</span> : <i style={{ height: widthPreviewHeight(item) }} />}</button>)}</div>
         </div>
         <button onClick={undo} disabled={!strokes.length} title="撤销 · Ctrl+Z"><ArrowUndo20Regular /></button>
         <button onClick={redo} disabled={!redoStrokes.length} title="重做 · Ctrl+Y"><ArrowRedo20Regular /></button>
@@ -573,8 +699,8 @@ function ScreenshotEditor() {
         <button onClick={() => api?.closeScreenshotEditor()} title="取消 · Esc"><Dismiss20Regular /></button>
       </div>}
       {selection && tool === 'select' && !strokes.length && <div className="keyboard-tip">{followingSelection
-        ? '移动鼠标定位预选区 · 左键拖动自定义选区 · F4 复制并原位贴图'
-        : '从任意位置拖动重新框选 · 拖边角调大小 · Alt 拖动选区 · F4 复制并原位贴图'}</div>}
+        ? '移动鼠标定位预选区 · 左键拖动自定义选区 · C 复制色值 · F4 复制并原位贴图'
+        : '从任意位置拖动重新框选 · 拖边角调大小 · C 复制色值 · Alt 拖动选区 · F4 贴图'}</div>}
     </main>
   );
 }

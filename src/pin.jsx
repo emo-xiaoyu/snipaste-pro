@@ -15,6 +15,12 @@ const api = window.clipboardAPI;
 const HOLD_DELAY = 180;
 const MOVE_THRESHOLD = 8;
 
+function objectUrlFromBytes(bytes) {
+  if (!bytes) return '';
+  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  return URL.createObjectURL(new Blob([view], { type: 'image/png' }));
+}
+
 function PinImage() {
   const initialId = new URLSearchParams(location.search).get('id');
   const [id, setId] = useState(initialId);
@@ -25,6 +31,7 @@ function PinImage() {
   const [selection, setSelectionState] = useState(null);
   const [pinMenu, setPinMenu] = useState(null);
   const [ocrNotice, setOcrNotice] = useState(null);
+  const [hudBadge, setHudBadge] = useState(null);
   const idRef = useRef(initialId);
   const imageRef = useRef(null);
   const dragRef = useRef(null);
@@ -32,16 +39,31 @@ function PinImage() {
   const textDragRef = useRef(null);
   const holdTimerRef = useRef(null);
   const noticeTimerRef = useRef(null);
+  const hudTimerRef = useRef(null);
+  const opacityRef = useRef(1);
   const recognizingRef = useRef(null);
   const textItemsRef = useRef([]);
   const textImageSizeRef = useRef(null);
   const textModeRef = useRef(false);
   const selectionRef = useRef(null);
   const transformingRef = useRef(false);
+  const imageUrlRef = useRef('');
 
   function setSelection(next) {
     selectionRef.current = next;
     setSelectionState(next);
+  }
+
+  function adoptEntryPayload(rawEntry) {
+    if (!rawEntry) {
+      setEntry(null);
+      return;
+    }
+    const nextUrl = objectUrlFromBytes(rawEntry.imageBytes) || rawEntry.imageUrl || '';
+    if (imageUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(imageUrlRef.current);
+    imageUrlRef.current = nextUrl;
+    const { imageBytes, ...rest } = rawEntry;
+    setEntry({ ...rest, imageUrl: nextUrl });
   }
 
   function setSelectableText(items, imageSize) {
@@ -67,6 +89,12 @@ function PinImage() {
     if (duration > 0) noticeTimerRef.current = setTimeout(() => setOcrNotice(null), duration);
   }
 
+  function showHudBadge(text) {
+    setHudBadge(text);
+    clearTimeout(hudTimerRef.current);
+    hudTimerRef.current = setTimeout(() => setHudBadge(null), 900);
+  }
+
   function resetTextInteraction() {
     clearTimeout(holdTimerRef.current);
     clearTimeout(noticeTimerRef.current);
@@ -84,10 +112,11 @@ function PinImage() {
       resetTextInteraction();
       idRef.current = payload.id;
       setId(payload.id);
-      setEntry(payload.entry);
+      opacityRef.current = 1;
+      adoptEntryPayload(payload.entry);
     });
     api?.pinRendererReady();
-    if (initialId) api?.getScreenshotEntry(initialId).then(setEntry);
+    if (initialId) api?.getScreenshotEntry(initialId).then(adoptEntryPayload);
     return unsubscribe;
   }, []);
 
@@ -108,7 +137,15 @@ function PinImage() {
       const activeId = idRef.current;
       if (!activeId) return;
       event.preventDefault();
-      api?.zoomPin(activeId, { deltaY: event.deltaY, clientX: event.clientX, clientY: event.clientY });
+      // Ctrl+wheel fades the pin in 5% steps (15%–100%); a plain wheel zooms.
+      if (event.ctrlKey && api?.setPinOpacity) {
+        const step = event.deltaY > 0 ? -0.05 : 0.05;
+        applyPinOpacity(Math.min(1, Math.max(0.15, Math.round((opacityRef.current + step) * 100) / 100)));
+        return;
+      }
+      void api?.zoomPin(activeId, { deltaY: event.deltaY, clientX: event.clientX, clientY: event.clientY }).then((result) => {
+        if (result?.success && Number.isFinite(result.scale)) showHudBadge(`${Math.round(result.scale * 100)}%`);
+      });
     };
     window.addEventListener('wheel', handleWheel, { passive: false });
     return () => window.removeEventListener('wheel', handleWheel);
@@ -134,6 +171,8 @@ function PinImage() {
   useEffect(() => () => {
     clearTimeout(holdTimerRef.current);
     clearTimeout(noticeTimerRef.current);
+    clearTimeout(hudTimerRef.current);
+    if (imageUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(imageUrlRef.current);
   }, []);
 
   if (!entry) return null;
@@ -309,19 +348,23 @@ function PinImage() {
       const context = canvas.getContext('2d');
       context.setTransform(...plan.matrix);
       context.drawImage(image, 0, 0);
-      const dataUrl = canvas.toDataURL('image/png');
-      const result = await api?.updatePinImage(idRef.current, dataUrl);
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('无法生成变换后的图片');
+      const result = await api?.updatePinImage(idRef.current, await blob.arrayBuffer());
       if (!result?.success) {
         showNotice({ working: false, success: false, message: result?.message || '图片变换失败' }, 3600);
         return;
       }
       resetTextInteraction();
+      const nextUrl = objectUrlFromBytes(result.imageBytes);
+      if (imageUrlRef.current.startsWith('blob:')) URL.revokeObjectURL(imageUrlRef.current);
+      imageUrlRef.current = nextUrl;
       setEntry((current) => current ? {
         ...current,
         width: plan.width,
         height: plan.height,
         content: `${plan.width} × ${plan.height} · PNG`,
-        imageUrl: result.imageUrl || dataUrl,
+        imageUrl: nextUrl,
       } : current);
       const labels = {
         'rotate-left': '已向左旋转',
@@ -337,9 +380,23 @@ function PinImage() {
     }
   }
 
+  function applyPinOpacity(next) {
+    opacityRef.current = next;
+    void api?.setPinOpacity(idRef.current, next).then((result) => {
+      if (result?.success) {
+        opacityRef.current = result.opacity;
+        showHudBadge(`不透明度 ${Math.round(result.opacity * 100)}%`);
+      }
+    });
+  }
+
   function handlePinMenuCommand(command) {
     if (command === 'copy-selection') copySelection();
     else if (command === 'finish-text-selection') setTextModeState(false);
+    else if (typeof command === 'string' && command.startsWith('set-opacity:')) {
+      const next = Number(command.slice('set-opacity:'.length));
+      if (Number.isFinite(next)) applyPinOpacity(next);
+    }
     else if (['rotate-left', 'rotate-right', 'flip-horizontal', 'flip-vertical'].includes(command)) transformPinnedImage(command);
   }
 
@@ -355,7 +412,7 @@ function PinImage() {
 
   return <main
     className={`pin-card ${textMode ? 'pin-card--text-mode' : ''}`}
-    title={textMode ? '拖动选择文字 · Ctrl+C 复制 · Esc 退出' : '轻按后滑动选字 · 快速拖动移动贴图 · 滚轮缩放'}
+    title={textMode ? '拖动选择文字 · Ctrl+C 复制 · Esc 退出' : '轻按后滑动选字 · 快速拖动移动贴图 · 滚轮缩放 · Ctrl+滚轮不透明度'}
     onContextMenu={openPinMenu}
     onPointerDown={beginPointer}
     onPointerMove={movePointer}
@@ -395,6 +452,7 @@ function PinImage() {
       {ocrNotice.working && <i />}
       <span>{ocrNotice.message}</span>
     </div>}
+    {hudBadge && <div className="pin-hud" role="status">{hudBadge}</div>}
   </main>;
 }
 

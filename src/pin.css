@@ -18,4 +18,5 @@
 .pin-ocr-notice.is-error { background: rgba(111,42,36,.93); }
 .pin-ocr-notice i { width: 12px; height: 12px; flex: 0 0 12px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: pin-ocr-spin .75s linear infinite; }
 @keyframes pin-ocr-spin { to { transform: rotate(360deg); } }
+.pin-hud { position: absolute; z-index: 6; left: 50%; top: 10px; transform: translateX(-50%); padding: 5px 10px; border-radius: 999px; background: rgba(31,37,28,.88); box-shadow: 0 6px 18px rgba(0,0,0,.24); color: #fff; font: 600 12px/1 "Segoe UI Variable", "Microsoft YaHei UI", sans-serif; white-space: nowrap; pointer-events: none; }
 @media (prefers-reduced-motion: reduce) { .pin-card > button { transition: none; }.pin-ocr-notice i { animation-duration: 1.5s; } }

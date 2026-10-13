@@ -42,6 +42,214 @@ export function textFontSizeFromLineWidth(lineWidth) {
   return 24;
 }
 
+export function highlighterLineWidth(lineWidth) {
+  if (lineWidth <= 3) return 14;
+  if (lineWidth >= 10) return 32;
+  return 22;
+}
+
+export function redactBrushWidth(lineWidth) {
+  if (lineWidth <= 3) return 26;
+  if (lineWidth >= 10) return 74;
+  return 46;
+}
+
+export function mosaicBlockSize(lineWidth) {
+  if (lineWidth <= 3) return 8;
+  if (lineWidth >= 10) return 22;
+  return 14;
+}
+
+export function blurRadius(lineWidth) {
+  if (lineWidth <= 3) return 6;
+  if (lineWidth >= 10) return 16;
+  return 10;
+}
+
+// Sampling region of a redaction stroke: the points' bounding box grown by
+// half the brush width, clamped to the image, and (for mosaic) snapped onto
+// the global block grid so overlapping strokes tile seamlessly.
+export function redactionBounds(stroke, size) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const item of stroke.points || []) {
+    if (item.x < minX) minX = item.x;
+    if (item.y < minY) minY = item.y;
+    if (item.x > maxX) maxX = item.x;
+    if (item.y > maxY) maxY = item.y;
+  }
+  const half = redactBrushWidth(stroke.lineWidth) / 2;
+  let x = clamp(minX - half, 0, size.width);
+  let y = clamp(minY - half, 0, size.height);
+  let right = clamp(maxX + half, 0, size.width);
+  let bottom = clamp(maxY + half, 0, size.height);
+  if (stroke.tool === 'mosaic') {
+    const block = mosaicBlockSize(stroke.lineWidth);
+    x = Math.floor(x / block) * block;
+    y = Math.floor(y / block) * block;
+    right = Math.min(Math.ceil(right / block) * block, size.width);
+    bottom = Math.min(Math.ceil(bottom / block) * block, size.height);
+  }
+  return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
+}
+
+const redactionCache = new WeakMap();
+const MAX_CACHED_EFFECT_AREA = 4096 * 4096;
+
+export function invalidateRedactionCache(stroke) {
+  redactionCache.delete(stroke);
+}
+
+function createDomCanvas(width, height) {
+  if (typeof document === 'undefined' || !document.createElement) return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  return canvas;
+}
+
+// Redaction always samples the frozen source image, never the live canvas:
+// overlapping strokes never compound, and undo/redo stays deterministic.
+function renderRedactionStroke(context, stroke, options) {
+  const source = options.source;
+  if (!source || !stroke.points || !stroke.points.length) return;
+  const size = {
+    width: source.naturalWidth || source.width,
+    height: source.naturalHeight || source.height,
+  };
+  if (!size.width || !size.height) return;
+  const bounds = redactionBounds(stroke, size);
+  if (bounds.width <= 0 || bounds.height <= 0) return;
+
+  const cached = redactionCache.get(stroke);
+  if (cached && cached.source === source
+    && cached.bounds.x === bounds.x && cached.bounds.y === bounds.y
+    && cached.bounds.width === bounds.width && cached.bounds.height === bounds.height) {
+    context.drawImage(cached.canvas, cached.x, cached.y);
+    return;
+  }
+
+  const createCanvas = options.createCanvas || createDomCanvas;
+  let sampleX = bounds.x;
+  let sampleY = bounds.y;
+  let sampleWidth = bounds.width;
+  let sampleHeight = bounds.height;
+  let radius = 0;
+  if (stroke.tool === 'blur') {
+    // Pad the sample region so the gaussian kernel never samples past the
+    // effect canvas edge; the extra ring is masked away below.
+    radius = blurRadius(stroke.lineWidth);
+    const pad = radius * 2;
+    sampleX = Math.max(0, Math.floor(bounds.x - pad));
+    sampleY = Math.max(0, Math.floor(bounds.y - pad));
+    sampleWidth = Math.min(Math.ceil(bounds.x + bounds.width + pad), size.width) - sampleX;
+    sampleHeight = Math.min(Math.ceil(bounds.y + bounds.height + pad), size.height) - sampleY;
+  }
+  if (sampleWidth <= 0 || sampleHeight <= 0) return;
+
+  let small = null;
+  if (stroke.tool === 'mosaic') {
+    const block = mosaicBlockSize(stroke.lineWidth);
+    const smallWidth = Math.max(1, Math.ceil(sampleWidth / block));
+    const smallHeight = Math.max(1, Math.ceil(sampleHeight / block));
+    small = createCanvas(smallWidth, smallHeight);
+    if (!small) return;
+    const sctx = small.getContext('2d');
+    if (!sctx) return;
+    sctx.imageSmoothingEnabled = true;
+    sctx.drawImage(source, sampleX, sampleY, sampleWidth, sampleHeight, 0, 0, smallWidth, smallHeight);
+  }
+
+  const effect = createCanvas(sampleWidth, sampleHeight);
+  if (!effect) return;
+  const ectx = effect.getContext('2d');
+  if (!ectx) return;
+
+  if (small) {
+    ectx.imageSmoothingEnabled = false;
+    ectx.drawImage(small, 0, 0, small.width, small.height, 0, 0, sampleWidth, sampleHeight);
+    ectx.imageSmoothingEnabled = true;
+  } else {
+    ectx.filter = `blur(${radius}px)`;
+    ectx.drawImage(source, sampleX, sampleY, sampleWidth, sampleHeight, 0, 0, sampleWidth, sampleHeight);
+    ectx.filter = 'none';
+  }
+
+  ectx.save();
+  ectx.globalCompositeOperation = 'destination-in';
+  ectx.translate(-sampleX, -sampleY);
+  ectx.lineCap = 'round';
+  ectx.lineJoin = 'round';
+  ectx.lineWidth = redactBrushWidth(stroke.lineWidth);
+  ectx.strokeStyle = '#000';
+  ectx.beginPath();
+  if (stroke.points.length === 1) {
+    ectx.moveTo(stroke.points[0].x, stroke.points[0].y);
+    ectx.lineTo(stroke.points[0].x, stroke.points[0].y);
+  } else {
+    stroke.points.forEach((item, index) => index ? ectx.lineTo(item.x, item.y) : ectx.moveTo(item.x, item.y));
+  }
+  ectx.stroke();
+  ectx.restore();
+
+  if (sampleWidth * sampleHeight <= MAX_CACHED_EFFECT_AREA) {
+    redactionCache.set(stroke, { canvas: effect, x: sampleX, y: sampleY, source, bounds });
+  }
+  context.drawImage(effect, sampleX, sampleY);
+}
+
+export function rgbToHsl(r, g, b) {
+  const red = clamp(r, 0, 255) / 255;
+  const green = clamp(g, 0, 255) / 255;
+  const blue = clamp(b, 0, 255) / 255;
+  const max = Math.max(red, green, blue);
+  const min = Math.min(red, green, blue);
+  let h = 0;
+  let s = 0;
+  const l = (max + min) / 2;
+
+  if (max !== min) {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch (max) {
+      case red:
+        h = (green - blue) / d + (green < blue ? 6 : 0);
+        break;
+      case green:
+        h = (blue - red) / d + 2;
+        break;
+      case blue:
+        h = (red - green) / d + 4;
+        break;
+    }
+    h = Math.round(h * 60);
+  }
+  return {
+    h: (h + 360) % 360,
+    s: Math.round(s * 100),
+    l: Math.round(l * 100),
+  };
+}
+
+export function formatColorValue(pixel, format = 'hex') {
+  if (!pixel) return '';
+  const r = clamp(Math.round(pixel.r ?? 0), 0, 255);
+  const g = clamp(Math.round(pixel.g ?? 0), 0, 255);
+  const b = clamp(Math.round(pixel.b ?? 0), 0, 255);
+  const hex = pixel.hex || `#${[r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')}`.toUpperCase();
+
+  if (format === 'rgb') {
+    return `rgb(${r}, ${g}, ${b})`;
+  }
+  if (format === 'hsl') {
+    const { h, s, l } = rgbToHsl(r, g, b);
+    return `hsl(${h}, ${s}%, ${l}%)`;
+  }
+  return hex;
+}
+
 function appendToken(lines, line, token, maxWidth, measureText) {
   let nextLine = line;
   for (const character of token) {
@@ -83,7 +291,7 @@ export function wrapTextLines(text, maxWidth, measureText) {
   return lines;
 }
 
-export function renderStrokes(context, strokes) {
+export function renderStrokes(context, strokes, options = {}) {
   context.lineCap = 'round';
   context.lineJoin = 'round';
   for (const stroke of strokes) {
@@ -92,8 +300,30 @@ export function renderStrokes(context, strokes) {
     context.lineWidth = stroke.lineWidth;
     if (stroke.tool === 'pen') {
       context.beginPath();
-      stroke.points.forEach((item, index) => index ? context.lineTo(item.x, item.y) : context.moveTo(item.x, item.y));
+      if (stroke.points.length === 1) {
+        context.moveTo(stroke.points[0].x, stroke.points[0].y);
+        context.lineTo(stroke.points[0].x, stroke.points[0].y);
+      } else {
+        stroke.points.forEach((item, index) => index ? context.lineTo(item.x, item.y) : context.moveTo(item.x, item.y));
+      }
       context.stroke();
+    } else if (stroke.tool === 'highlighter') {
+      context.save();
+      context.globalAlpha = Number.isFinite(stroke.globalAlpha) ? stroke.globalAlpha : 0.38;
+      context.lineCap = 'round';
+      context.lineJoin = 'round';
+      context.lineWidth = stroke.highlighterWidth || highlighterLineWidth(stroke.lineWidth);
+      context.beginPath();
+      if (stroke.points.length === 1) {
+        context.moveTo(stroke.points[0].x, stroke.points[0].y);
+        context.lineTo(stroke.points[0].x, stroke.points[0].y);
+      } else {
+        stroke.points.forEach((item, index) => index ? context.lineTo(item.x, item.y) : context.moveTo(item.x, item.y));
+      }
+      context.stroke();
+      context.restore();
+    } else if (stroke.tool === 'mosaic' || stroke.tool === 'blur') {
+      renderRedactionStroke(context, stroke, options);
     } else if (stroke.tool === 'rect') {
       const rect = normalizedRect(stroke.start, stroke.end);
       context.strokeRect(rect.x, rect.y, rect.width, rect.height);

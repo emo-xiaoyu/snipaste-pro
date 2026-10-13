@@ -85,19 +85,39 @@ function passesLuhn(value) {
 }
 
 function textFingerprint(content, html = '') {
-  return `text:${hashBuffer(Buffer.from(`${normalizeText(content)}\n${normalizeText(html)}`))}`;
+  const text = String(content ?? '').replace(/\0/g, '').replace(/\r\n/g, '\n');
+  return `text:${hashBuffer(Buffer.from(`${text}\n${normalizeText(html)}`))}`;
 }
 
 function fileFingerprint(files) {
   return `file:${hashBuffer(Buffer.from([...files].map((item) => item.toLocaleLowerCase()).sort().join('\n')))}`;
 }
 
+// Renderer image payloads cross two serialization boundaries (contextBridge
+// and IPC structured clone), so identical bytes can arrive as an ArrayBuffer,
+// a Uint8Array, or a Buffer depending on origin; normalize before use.
+function coerceImageBytes(value) {
+  if (Buffer.isBuffer(value)) return value.length ? value : null;
+  if (value instanceof Uint8Array) return value.byteLength ? Buffer.from(value) : null;
+  if (value instanceof ArrayBuffer) return value.byteLength ? Buffer.from(value) : null;
+  return null;
+}
+
 function mergePreferences(value) {
   const input = value && typeof value === 'object' ? value : {};
-  const historyLimit = Math.min(1000, Math.max(20, Number(input.historyLimit) || DEFAULT_PREFERENCES.historyLimit));
-  const pasteDelay = Math.min(300, Math.max(0, Number(input.pasteDelay) || DEFAULT_PREFERENCES.pasteDelay));
-  const remotePasteDelay = Math.min(1200, Math.max(100, Number(input.remotePasteDelay) || DEFAULT_PREFERENCES.remotePasteDelay));
-  return { ...DEFAULT_PREFERENCES, ...input, historyLimit, pasteDelay, remotePasteDelay };
+  // Whitelist known keys so legacy or foreign fields never persist forever.
+  const allowed = Object.keys(DEFAULT_PREFERENCES);
+  const picked = {};
+  for (const key of allowed) {
+    if (key in input) picked[key] = input[key];
+  }
+  const historyLimit = Math.min(1000, Math.max(20, Number(picked.historyLimit) || DEFAULT_PREFERENCES.historyLimit));
+  const requestedDelay = Number(picked.pasteDelay ?? DEFAULT_PREFERENCES.pasteDelay);
+  const pasteDelay = Number.isFinite(requestedDelay)
+    ? Math.min(300, Math.max(0, requestedDelay))
+    : DEFAULT_PREFERENCES.pasteDelay;
+  const remotePasteDelay = Math.min(1200, Math.max(100, Number(picked.remotePasteDelay) || DEFAULT_PREFERENCES.remotePasteDelay));
+  return { ...DEFAULT_PREFERENCES, ...picked, historyLimit, pasteDelay, remotePasteDelay };
 }
 
 function isRemoteSource(source) {
@@ -129,6 +149,13 @@ function defaultCaptureRegion(displayBounds, cursor, preferredWidth = 520, prefe
     Math.max(displayBounds.y, Math.round(cursor.y - height / 2)),
   );
   return { x, y, width, height };
+}
+
+function cursorWindowPosition(workArea, size, cursor) {
+  return {
+    x: Math.round(Math.min(workArea.x + Math.max(0, workArea.width - size.width), Math.max(workArea.x, cursor.x - size.width / 2))),
+    y: Math.round(Math.min(workArea.y + Math.max(0, workArea.height - size.height), Math.max(workArea.y, cursor.y - size.height / 2))),
+  };
 }
 
 function capturePinBounds(displayBounds, imageSize, crop) {
@@ -194,9 +221,11 @@ function migrateEntry(entry) {
 module.exports = {
   DEFAULT_PREFERENCES,
   classifyText,
+  coerceImageBytes,
   detectSensitive,
   capturePinBounds,
   defaultCaptureRegion,
+  cursorWindowPosition,
   entryTitle,
   fileFingerprint,
   hashBuffer,

@@ -3,7 +3,9 @@ const assert = require('node:assert/strict');
 const {
   classifyText,
   capturePinBounds,
+  coerceImageBytes,
   defaultCaptureRegion,
+  cursorWindowPosition,
   detectSensitive,
   entryTitle,
   mergePreferences,
@@ -35,6 +37,10 @@ test('fingerprints normalize Windows newlines', () => {
   assert.equal(textFingerprint('hello\r\nworld'), textFingerprint('hello\nworld'));
 });
 
+test('fingerprints distinguish meaningful indentation and trailing whitespace', () => {
+  assert.notEqual(textFingerprint('    hello\n'), textFingerprint('hello'));
+});
+
 test('builds useful file titles and migrates old records', () => {
   assert.equal(entryTitle('', 'file', ['E:\\a.txt', 'E:\\b.png']), 'a.txt 等 2 个文件');
   const migrated = migrateEntry({ type: 'text', createdAt: 100 });
@@ -47,6 +53,18 @@ test('preference limits are clamped', () => {
   assert.equal(mergePreferences({ historyLimit: 5000 }).historyLimit, 1000);
   assert.equal(mergePreferences({ pasteDelay: 999 }).pasteDelay, 300);
   assert.equal(mergePreferences({ remotePasteDelay: 1 }).remotePasteDelay, 100);
+});
+
+test('zero paste delay remains zero after preference merging', () => {
+  assert.equal(mergePreferences({ pasteDelay: 0 }).pasteDelay, 0);
+  assert.equal(mergePreferences({ pasteDelay: 'invalid' }).pasteDelay, 35);
+});
+
+test('preference merging ignores unknown keys from legacy stores', () => {
+  const merged = mergePreferences({ historyLimit: 300, legacyTheme: 'dark', obsoleteFlag: true });
+  assert.equal(merged.historyLimit, 300);
+  assert.equal('legacyTheme' in merged, false);
+  assert.equal('obsoleteFlag' in merged, false);
 });
 
 test('uses a longer delay only for recognized remote-control windows', () => {
@@ -79,6 +97,14 @@ test('centers the default screenshot region on the cursor and clamps it to the d
     defaultCaptureRegion({ x: -1280, y: 0, width: 1280, height: 720 }, { x: -1270, y: 10 }),
     { x: -1280, y: 0, width: 520, height: 320 },
   );
+});
+
+test('opens the launcher at the cursor and clamps it to the current display work area', () => {
+  const area = { x: 0, y: 0, width: 1920, height: 1040 };
+  const size = { width: 520, height: 520 };
+  assert.deepEqual(cursorWindowPosition(area, size, { x: 900, y: 600 }), { x: 640, y: 340 });
+  assert.deepEqual(cursorWindowPosition(area, size, { x: 1910, y: 1030 }), { x: 1400, y: 520 });
+  assert.deepEqual(cursorWindowPosition({ x: -1280, y: -200, width: 1280, height: 720 }, size, { x: -1270, y: -190 }), { x: -1280, y: -200 });
 });
 
 test('maps physical screenshot pixels back to exact desktop pin bounds', () => {
@@ -114,4 +140,25 @@ test('resets a transformed pin around its center using the original display area
   assert.deepEqual(resetPinBounds({ x: 100, y: 200, width: 800, height: 450 }, 180000, 9 / 16), {
     x: 341, y: 143, width: 318, height: 565,
   });
+});
+
+test('coerceImageBytes accepts every byte shape that crosses the IPC boundary', () => {
+  const payload = Buffer.from([1, 2, 3, 4]);
+  const fromBuffer = coerceImageBytes(payload);
+  const fromView = coerceImageBytes(new Uint8Array(payload));
+  assert.deepEqual(fromBuffer, payload);
+  assert.ok(Buffer.isBuffer(fromBuffer));
+  assert.deepEqual(fromView, payload);
+  assert.ok(Buffer.isBuffer(fromView));
+  const detached = new ArrayBuffer(4);
+  new Uint8Array(detached).set(payload);
+  const fromArrayBuffer = coerceImageBytes(detached);
+  assert.deepEqual(fromArrayBuffer, payload);
+  assert.ok(Buffer.isBuffer(fromArrayBuffer));
+  assert.equal(coerceImageBytes(new ArrayBuffer(0)), null);
+  assert.equal(coerceImageBytes(new Uint8Array(0)), null);
+  assert.equal(coerceImageBytes(Buffer.alloc(0)), null);
+  assert.equal(coerceImageBytes(null), null);
+  assert.equal(coerceImageBytes('data:image/png;base64,AAAA'), null);
+  assert.equal(coerceImageBytes({ type: 'Buffer', data: [1, 2, 3] }), null);
 });
