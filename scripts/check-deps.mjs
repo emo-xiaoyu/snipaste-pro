@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-// Dependency hygiene check for the portable Electron app:
+// Dependency hygiene check for the portable app:
 //   - package.json "dependencies" must stay empty (portable build ships zero
 //     runtime npm deps, per AGENTS.md).
 //   - every devDependency must be referenced from source code or the
@@ -16,7 +16,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
 
-const SCAN_DIRS = ['src', 'electron', 'scripts', 'worker'];
+const SCAN_DIRS = ['src', 'src-tauri', 'scripts', 'worker'];
 const SCAN_ROOT_FILES = ['vite.config.mjs'];
 const CODE_EXTENSIONS = new Set(['.js', '.jsx', '.cjs', '.mjs', '.ts', '.tsx']);
 const SKIP_DIRS = new Set([

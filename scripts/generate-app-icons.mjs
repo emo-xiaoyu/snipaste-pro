@@ -6,11 +6,11 @@ import sharp from 'sharp';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const source = path.join(root, 'public', 'favicon.svg');
 const buildDir = path.join(root, 'build');
-const electronAssetsDir = path.join(root, 'electron', 'assets');
+const appAssetsDir = path.join(root, 'src-tauri', 'assets');
 
 await Promise.all([
   fs.mkdir(buildDir, { recursive: true }),
-  fs.mkdir(electronAssetsDir, { recursive: true }),
+  fs.mkdir(appAssetsDir, { recursive: true }),
 ]);
 
 const iconPng = await sharp(source, { density: 384 })
@@ -41,7 +41,7 @@ icoEntry.writeUInt32LE(22, 12);
 await Promise.all([
   fs.writeFile(path.join(buildDir, 'icon.png'), iconPng),
   fs.writeFile(path.join(buildDir, 'icon.ico'), Buffer.concat([icoHeader, icoEntry, iconPng])),
-  fs.writeFile(path.join(electronAssetsDir, 'pasty-tray.png'), trayPng),
+  fs.writeFile(path.join(appAssetsDir, 'pasty-tray.png'), trayPng),
 ]);
 
 console.log('Generated Pasty application and tray icons.');

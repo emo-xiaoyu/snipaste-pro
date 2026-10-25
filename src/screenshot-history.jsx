@@ -1,3 +1,4 @@
+import './bridge/tauri-adapter.js';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ChevronLeft20Regular, ChevronRight20Regular, Dismiss20Regular, Image20Regular, Pin20Regular } from '@fluentui/react-icons';

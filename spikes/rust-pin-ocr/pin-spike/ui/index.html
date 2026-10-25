@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #fff; }
+  img { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<img id="im" src="pattern.png" width="600" height="400">
+<script>
+  // Exact CSS size is injected from Rust as (physical_px / scale_factor) so the
+  // image always maps 1:1 onto physical desktop pixels regardless of DPI.
+  window.__setup = (w, h) => {
+    const im = document.getElementById('im');
+    im.style.width = w + 'px';
+    im.style.height = h + 'px';
+    window.__pinReady = true;
+  };
+</script>
+</body>
+</html>

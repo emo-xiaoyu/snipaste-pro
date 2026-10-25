@@ -1,3 +1,4 @@
+import './bridge/tauri-adapter.js';
 import { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { CheckmarkCircle20Filled, Code20Regular, Document20Regular, Globe20Regular, Image20Regular, TextDescription20Regular } from '@fluentui/react-icons';

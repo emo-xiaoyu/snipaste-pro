@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default permissions for Pasty windows: core invoke/event access.","local":true,"windows":["*"],"permissions":["core:default"]}}

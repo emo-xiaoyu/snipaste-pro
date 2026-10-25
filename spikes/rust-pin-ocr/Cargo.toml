@@ -1,0 +1,6 @@
+[workspace]
+members = ["native-spike", "pin-spike"]
+resolver = "2"
+
+[profile.dev]
+debug = false

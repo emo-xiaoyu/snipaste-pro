@@ -16,3 +16,5 @@ out/
 .zcode/
 .agents/
 implementation-*.png
+src-tauri/target/
+spikes/*/target/

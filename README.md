@@ -11,7 +11,7 @@ Pasty 是一个面向 Windows 的本地剪贴板与截图贴图小工具：自�
 - 默认跳过密码、令牌、银行卡号等敏感内容。
 - 右下角显示不抢焦点的短暂保存提示。
 - 设置页可独立开关捕获类型、来源、去重、敏感保护和历史上限。
-- 粘贴使用启动时预热的 Windows 辅助进程，本地默认只等待 35ms；识别到 UU远程、ToDesk、向日葵、RDP 等远控窗口时自动切换为可配置的同步等待。
+- 自动粘贴在主进程内直接发送按键，本地默认只等待 35ms；识别到 UU远程、ToDesk、向日葵、RDP 等远控窗口时自动切换为可配置的同步等待。
 
 ## 使用方式
 
@@ -31,9 +31,11 @@ Pasty 是一个面向 Windows 的本地剪贴板与截图贴图小工具：自�
 - 输入关键词搜索，按 `↑` / `↓` 选择，按 `Enter` 粘贴到刚才使用的应用。
 - 在“常用”中保存长期使用的指令、网址、文本或当前剪贴板图片。
 - 点击右下角明确标注的“快捷键”按钮即可修改应用唤出、截图、快速截图贴桌面和截图历史快捷键；这些选项位于设置页第一屏。
-- 历史数据保存在 `%APPDATA%\pasty-clipboard`，图片只保存在本机。
+- 历史数据保存在 `%APPDATA%\Pasty`，图片只保存在本机。
 
 ## 本地运行
+
+Electron 版（迁移期保留）：
 
 ```powershell
 npm install
@@ -47,11 +49,28 @@ npm run start
 npm run desktop
 ```
 
-自动回贴优先使用 PowerShell 7（`pwsh.exe`），未安装时自动回退到系统内置 PowerShell。如果自动按键不可用，内容仍会写入系统剪贴板。
+Rust/Tauri 版（主进程重写，见 `src-tauri/`）：
+
+```powershell
+npm install
+npm run build:tauri     # 前端打包 + cargo release 编译
+src-tauri\target\release\pasty.exe
+```
+
+
+自动回贴优先使用 PowerShell 7（`pwsh.exe`），未安装时自动回退到系统内置 PowerShell。如果自动按键不可用，内容仍会写入系统剪贴板。（Rust 版主进程内直接 `keybd_event`，不再启动 PowerShell。）
 
 ## 构建 Windows 分发包
 
-首选便携版（免安装 zip，运行时零 npm 依赖）：
+首选 Tauri 便携版（单文件 exe，前端已嵌入，约 10MB）：
+
+```powershell
+npm run build:portable:tauri
+```
+
+产物为 `release/Pasty-Tauri-Portable-<版本>.zip`，解压到任意目录直接运行 `Pasty.exe`（要求系统具备 WebView2 运行时，Windows 10/11 一般已预装）。
+
+Electron 便携版（迁移期保留，体积约 124MB）：
 
 ```powershell
 npm run build:portable

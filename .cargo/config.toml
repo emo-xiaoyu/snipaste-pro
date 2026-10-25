@@ -1,0 +1,12 @@
+# Project-scoped cargo registry mirror. crates.io direct connections are
+# unreliable from this network; rsproxy is a full sparse-index mirror.
+# Remove this file to restore the default registry.
+
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
